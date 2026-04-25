@@ -1,0 +1,23 @@
+FROM rocker/tidyverse:4.3.2
+
+# Системные зависимости для yaml и aws.s3
+RUN apt-get update && apt-get install -y \
+    libyaml-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Доставляем только то, чего нет в rocker/tidyverse
+RUN R -q -e " \
+    options(repos = c( \
+        PPM  = 'https://packagemanager.posit.co/cran/__linux__/jammy/latest', \
+        CRAN = 'https://cloud.r-project.org' \
+    )); \
+    install.packages(c('yaml', 'aws.s3', 'DBI', 'RClickhouse')); \
+    pkgs <- c('jsonlite','yaml','stringr','DBI','aws.s3','RClickhouse'); \
+    for (p in pkgs) { library(p, character.only=TRUE); cat(p, ' OK\n') } \
+"
+
+WORKDIR /app
+COPY R /app/R
+COPY config /app/config
+
+CMD ["Rscript", "/app/R/main.R"]
