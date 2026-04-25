@@ -59,7 +59,75 @@ docker-compose run etl Rscript /app/R/main.R <s3_bucket_url> <item_name>
 | `flow_edges`             | Рёбра дерева потоков (parent → child, depth, path)            |
 | `conversation_artifacts` | Артефакты HTTP (URI, заголовки, тело, хеши, magic, peinfo)    |
 
-DDL см. в [r-etl/R/clickhouse_io.R](./r-etl/R/clickhouse_io.R).
+### DDL
+
+Источник истины — [r-etl/R/clickhouse_io.R](./r-etl/R/clickhouse_io.R), таблицы
+создаются автоматически на старте пайплайна (`CREATE TABLE IF NOT EXISTS`).
+
+```sql
+CREATE TABLE IF NOT EXISTS dataset_info (
+  pcap_file         String,
+  analysis_time     DateTime,
+  captipper_version String,
+  traffic_time      DateTime
+) ENGINE = MergeTree()
+ORDER BY (pcap_file);
+
+CREATE TABLE IF NOT EXISTS client_attributes (
+  attribute_name  String,
+  attribute_value String
+) ENGINE = MergeTree()
+ORDER BY (attribute_name);
+
+CREATE TABLE IF NOT EXISTS flow_edges (
+  parent_name String,
+  child_name  String,
+  depth       UInt32,
+  root_name   String,
+  path        String
+) ENGINE = MergeTree()
+ORDER BY (parent_name, child_name);
+
+CREATE TABLE IF NOT EXISTS conversation_artifacts (
+  conversation_idx        UInt32,
+  uri_idx                 UInt32,
+  conversation_name       String,
+  conversation_ip_raw     String,
+  conversation_host       String,
+  conversation_port       Nullable(UInt16),
+  artifact_id             Nullable(UInt32),
+  event_time_raw          String,
+  event_time_parsed       Nullable(DateTime),
+  host                    String,
+  server_ip_raw           String,
+  server_host             String,
+  server_port             Nullable(UInt16),
+  uri                     String,
+  short_uri               String,
+  method                  String,
+  filename                String,
+  referer                 String,
+  request_headers_raw     String,
+  response_headers_raw    String,
+  response_status_raw     String,
+  response_status_code    Nullable(UInt16),
+  response_content_type   String,
+  response_length_raw     String,
+  response_length_bytes   Nullable(UInt64),
+  response_body_raw       String,
+  response_body_base64    String,
+  response_peek           String,
+  md5                     String,
+  sha256                  String,
+  magic_ext               String,
+  magic_name              String,
+  is_binary               Nullable(UInt8),
+  is_executable           Nullable(UInt8),
+  hexpeek                 String,
+  peinfo_raw              String
+) ENGINE = MergeTree()
+ORDER BY (conversation_idx, uri_idx);
+```
 
 ## Конфигурация (env)
 
