@@ -79,3 +79,26 @@ get_s3_item <- function(s3_bucket_url, item_name) {
     stop(sprintf("Failed to get S3 item '%s': %s", download_url, e$message))
   })
 }
+
+# Скачивает NDJSON (Zeek conn.log в JSON-режиме): по объекту на строку.
+get_s3_ndjson <- function(s3_bucket_url, item_name) {
+  s3_endpoint <- Sys.getenv("S3_ENDPOINT_URL", Sys.getenv("S3_ENDPOINT", ""))
+  base <- gsub("/+$", "", if (nchar(s3_endpoint) > 0) s3_endpoint else s3_bucket_url)
+  download_url <- paste0(base, "/", item_name)
+
+  info(sprintf("S3 NDJSON fetch URL: %s", download_url))
+
+  tmp_file <- tempfile(fileext = ".ndjson")
+  on.exit(unlink(tmp_file), add = TRUE)
+
+  download.file(url = download_url, destfile = tmp_file, quiet = TRUE, method = "libcurl")
+
+  if (!file.exists(tmp_file) || file.info(tmp_file)$size == 0) {
+    stop(sprintf("Downloaded NDJSON is empty or missing: %s", download_url))
+  }
+
+  lines <- readLines(tmp_file, warn = FALSE, encoding = "UTF-8")
+  lines <- lines[nzchar(trimws(lines)) & !startsWith(trimws(lines), "#")]
+
+  lapply(lines, function(ln) fromJSON(ln, simplifyVector = FALSE))
+}

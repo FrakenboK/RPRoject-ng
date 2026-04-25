@@ -129,11 +129,47 @@ create_conversation_artifacts_table <- function(conn) {
   })
 }
 
+create_tcp_sessions_table <- function(conn) {
+  query <- "
+    CREATE TABLE IF NOT EXISTS tcp_sessions (
+      uid           String,
+      ts            DateTime,
+      orig_h        String,
+      orig_p        Nullable(UInt16),
+      resp_h        String,
+      resp_p        Nullable(UInt16),
+      proto         LowCardinality(String),
+      service       String,
+      duration_sec  Nullable(Float64),
+      orig_bytes    Nullable(UInt64),
+      resp_bytes    Nullable(UInt64),
+      conn_state    LowCardinality(String),
+      missed_bytes  Nullable(UInt64),
+      history       String,
+      orig_pkts     Nullable(UInt64),
+      orig_ip_bytes Nullable(UInt64),
+      resp_pkts     Nullable(UInt64),
+      resp_ip_bytes Nullable(UInt64),
+      local_orig    Nullable(UInt8),
+      local_resp    Nullable(UInt8)
+    ) ENGINE = MergeTree()
+    ORDER BY (ts, uid)
+  "
+
+  tryCatch({
+    DBI::dbExecute(conn, query)
+    info("Table tcp_sessions created or already exists")
+  }, error = function(e) {
+    stop(sprintf("Failed to create tcp_sessions table: %s", e$message))
+  })
+}
+
 create_all_tables <- function(conn) {
   create_dataset_info_table(conn)
   create_client_attributes_table(conn)
   create_flow_edges_table(conn)
   create_conversation_artifacts_table(conn)
+  create_tcp_sessions_table(conn)
 }
 
 insert_dataset_info <- function(conn, dataset_info) {
@@ -209,11 +245,35 @@ insert_conversation_artifacts <- function(conn, artifacts) {
   })
 }
 
+insert_tcp_sessions <- function(conn, tcp_sessions) {
+  if (nrow(tcp_sessions) == 0) {
+    warning_log("No tcp_sessions to insert")
+    return(invisible(NULL))
+  }
+
+  string_cols <- c("uid", "orig_h", "resp_h", "proto", "service", "conn_state", "history")
+  for (col in string_cols) {
+    if (col %in% names(tcp_sessions)) {
+      tcp_sessions[[col]][is.na(tcp_sessions[[col]])] <- ""
+    }
+  }
+
+  tryCatch({
+    DBI::dbWriteTable(conn, "tcp_sessions", tcp_sessions, append = TRUE, row.names = FALSE)
+    info(sprintf("Inserted %d row(s) into tcp_sessions", nrow(tcp_sessions)))
+  }, error = function(e) {
+    stop(sprintf("Failed to insert tcp_sessions: %s", e$message))
+  })
+}
+
 insert_normalized_data <- function(conn, normalized_data) {
   insert_dataset_info(conn, normalized_data$dataset_info)
   insert_client_attributes(conn, normalized_data$client_attributes)
   insert_flow_edges(conn, normalized_data$flow_edges)
   insert_conversation_artifacts(conn, normalized_data$conversation_artifacts)
+  if (!is.null(normalized_data$tcp_sessions)) {
+    insert_tcp_sessions(conn, normalized_data$tcp_sessions)
+  }
 }
 
 test_connection <- function(conn) {
