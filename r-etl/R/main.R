@@ -3,6 +3,7 @@ source("R/s3_io.R")
 source("R/parsing.R")
 source("R/normalization.R")
 source("R/clickhouse_io.R")
+source("R/tcp_sessions.R")
 
 run_etl_pipeline <- function(s3_bucket_url, item_name) {
   info("Starting ETL pipeline")
@@ -32,6 +33,20 @@ run_etl_pipeline <- function(s3_bucket_url, item_name) {
     error_log(sprintf("Failed to normalize data: %s", e$message))
     stop(e)
   })
+
+  # Опциональный шаг: загрузка TCP-сессий из Zeek conn.log (NDJSON) в S3.
+  conn_log_prefix <- Sys.getenv("S3_CONN_LOG_PREFIX", "")
+  if (nchar(conn_log_prefix) > 0) {
+    normalized_data$tcp_sessions <- tryCatch({
+      info(sprintf("Fetching Zeek conn.log: %s", conn_log_prefix))
+      records <- get_s3_ndjson(s3_bucket_url, conn_log_prefix)
+      info(sprintf("Loaded %d conn.log record(s)", length(records)))
+      normalize_tcp_sessions(parse_zeek_conn_log(records))
+    }, error = function(e) {
+      warning_log(sprintf("Skipping TCP sessions: %s", e$message))
+      empty_tcp_sessions_df()
+    })
+  }
 
   conn <- tryCatch({
     info("Connecting to ClickHouse")

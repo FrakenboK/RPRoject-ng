@@ -58,6 +58,7 @@ docker-compose run etl Rscript /app/R/main.R <s3_bucket_url> <item_name>
 | `client_attributes`      | HTTP-атрибуты клиента (User-Agent, Accept и т.п.)             |
 | `flow_edges`             | Рёбра дерева потоков (parent → child, depth, path)            |
 | `conversation_artifacts` | Артефакты HTTP (URI, заголовки, тело, хеши, magic, peinfo)    |
+| `tcp_sessions`           | TCP-сессии из Zeek `conn.log` (uid, ts, src/dst, байты/пакеты, conn_state, history) |
 
 ### DDL
 
@@ -127,15 +128,64 @@ CREATE TABLE IF NOT EXISTS conversation_artifacts (
   peinfo_raw              String
 ) ENGINE = MergeTree()
 ORDER BY (conversation_idx, uri_idx);
+
+CREATE TABLE IF NOT EXISTS tcp_sessions (
+  uid           String,
+  ts            DateTime,
+  orig_h        String,
+  orig_p        Nullable(UInt16),
+  resp_h        String,
+  resp_p        Nullable(UInt16),
+  proto         LowCardinality(String),
+  service       String,
+  duration_sec  Nullable(Float64),
+  orig_bytes    Nullable(UInt64),
+  resp_bytes    Nullable(UInt64),
+  conn_state    LowCardinality(String),
+  missed_bytes  Nullable(UInt64),
+  history       String,
+  orig_pkts     Nullable(UInt64),
+  orig_ip_bytes Nullable(UInt64),
+  resp_pkts     Nullable(UInt64),
+  resp_ip_bytes Nullable(UInt64),
+  local_orig    Nullable(UInt8),
+  local_resp    Nullable(UInt8)
+) ENGINE = MergeTree()
+ORDER BY (ts, uid);
 ```
+
+## Сбор TCP-сессий (Zeek conn.log)
+
+Источник — `conn.log`, сгенерированный Zeek в JSON-режиме (NDJSON, по объекту
+на строку), залитый в тот же бакет S3, что и CaptIPPER-дамп. Шаг опциональный:
+включается переменной `S3_CONN_LOG_PREFIX` (имя/префикс объекта в бакете).
+
+```bash
+# на хосте с трафиком
+zeek -r capture.pcap LogAscii::use_json=T
+aws s3 cp conn.log s3://<bucket>/conn.log
+```
+
+```bash
+# в .env
+S3_CONN_LOG_PREFIX=conn.log
+```
+
+При запуске пайплайн скачивает NDJSON, фильтрует только `proto == "TCP"`,
+нормализует поля и пишет в таблицу `tcp_sessions`. Если переменная не задана —
+шаг полностью пропускается, остальная часть пайплайна работает как раньше.
+
+Код: [r-etl/R/tcp_sessions.R](./r-etl/R/tcp_sessions.R), загрузка NDJSON —
+`get_s3_ndjson()` в [r-etl/R/s3_io.R](./r-etl/R/s3_io.R).
 
 ## Конфигурация (env)
 
 Поддерживаются как новые `AWS_*`, так и легаси `S3_*` имена переменных
 (см. [r-etl/R/s3_io.R](./r-etl/R/s3_io.R)).
 
-- **S3:** `S3_ENDPOINT_URL`, `S3_BUCKET`, `S3_PREFIX`, `AWS_ACCESS_KEY_ID`,
-  `AWS_SECRET_ACCESS_KEY`, `AWS_DEFAULT_REGION`
+- **S3:** `S3_ENDPOINT_URL`, `S3_BUCKET`, `S3_PREFIX`, `S3_CONN_LOG_PREFIX`
+  (опц., включает сбор TCP-сессий), `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`,
+  `AWS_DEFAULT_REGION`
 - **ClickHouse:** `CLICKHOUSE_HOST`, `CLICKHOUSE_PORT`, `CLICKHOUSE_USER`,
   `CLICKHOUSE_PASSWORD`, `CLICKHOUSE_DATABASE`
 - **Прочее:** `LOG_LEVEL` (по умолчанию `INFO`), `TZ` (по умолчанию `UTC`)
