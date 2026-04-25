@@ -1,11 +1,9 @@
 FROM rocker/tidyverse:4.3.2
 
-# Системные зависимости для yaml и aws.s3
 RUN apt-get update && apt-get install -y \
     libyaml-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# Доставляем только то, чего нет в rocker/tidyverse
 RUN R -q -e " \
     options(repos = c( \
         PPM  = 'https://packagemanager.posit.co/cran/__linux__/jammy/latest', \
