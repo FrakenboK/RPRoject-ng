@@ -29,6 +29,8 @@ services:
       CLICKHOUSE_PORT: 9000
       STAGING_DIR: /tmp/r-etl-staging
       TZ: ${TZ:-UTC}
+    volumes:
+      - ./local_data:/data:ro
     restart: "no"
 
   analysis:

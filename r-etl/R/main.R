@@ -6,11 +6,16 @@ source("R/tcp_sessions.R")
 source("R/clickhouse_io.R")
 
 process_source_object <- function(conn, source_object, ingest_run_id, staging_dir) {
-  local_path <- download_s3_object(
-    bucket = source_object$bucket,
-    key = source_object$key,
-    destination_root = staging_dir
-  )
+  local_data_dir <- Sys.getenv("LOCAL_DATA_DIR", "")
+  if (nzchar(local_data_dir)) {
+    local_path <- get_local_file_path(source_object)
+  } else {
+    local_path <- download_s3_object(
+      bucket = source_object$bucket,
+      key = source_object$key,
+      destination_root = staging_dir
+    )
+  }
 
   handler <- choose_handler(source_object$key, local_path)
   if (identical(handler, "unsupported")) {
@@ -71,9 +76,16 @@ run_etl_pipeline <- function() {
 
   ingest_run_id <- build_ingest_run_id()
   info(sprintf("Starting ETL init-container run: %s", ingest_run_id))
-  info(sprintf("S3 bucket: %s | prefix: %s", config$s3_bucket, config$s3_prefix))
 
-  source_objects <- list_s3_objects(config$s3_bucket, config$s3_prefix)
+  local_data_dir <- Sys.getenv("LOCAL_DATA_DIR", "")
+
+  source_objects <- if (local_data_dir != "") {
+    info(sprintf("Using local data directory: %s", local_data_dir))
+    list_local_objects(local_data_dir)
+  } else {
+    info(sprintf("S3 bucket: %s | prefix: %s", config$s3_bucket, config$s3_prefix))
+    list_s3_objects(config$s3_bucket, config$s3_prefix)
+  }
   source_objects <- filter_source_objects(source_objects)
 
   if (nrow(source_objects) == 0) {

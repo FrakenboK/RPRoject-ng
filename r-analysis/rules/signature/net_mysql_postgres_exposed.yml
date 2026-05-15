@@ -1,0 +1,24 @@
+title: Database Port Exposure
+id: net-mysql-postgres-exposed
+status: experimental
+description: Detects TCP connections to database ports from external sources, indicating exposed database services.
+author: team
+logsource:
+    category: network_connection
+    product: idc
+detection:
+    selection_proto:
+        transport_proto: TCP
+    selection_ports:
+        dst_port:
+            - 3306
+            - 5432
+            - 1433
+            - 27017
+            - 6379
+    condition: selection_proto and selection_ports
+level: high
+tags:
+    - attack.initial-access
+    - attack.t1190
+    - network

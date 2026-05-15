@@ -26,8 +26,8 @@ ENV MAKEFLAGS="-j4"
 
 RUN R -q -e "install.packages('pak', repos = sprintf('https://r-lib.github.io/p/pak/stable/%s/%s/%s', .Platform[['pkgType']], R.Version()[['os']], R.Version()[['arch']]))"
 
-RUN R -q -e "options(repos = c(CRAN = 'https://cloud.r-project.org')); \
-    pak::pkg_install(c('shiny', 'bslib', 'DT', 'data.table', 'jsonlite', 'DBI', 'RClickhouse', 'processx'))"
+RUN R -q -e "options(repos = c(CRAN = 'https://cran.rstudio.com')); \
+    pak::pkg_install(c('shiny', 'bslib', 'DT', 'data.table', 'jsonlite', 'DBI', 'bit64', 'RClickhouse', 'processx'))"
 
 WORKDIR /app
 COPY R /app/R

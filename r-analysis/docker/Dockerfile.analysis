@@ -13,7 +13,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     pkg-config \
     && rm -rf /var/lib/apt/lists/*
 
-RUN R -q -e "options(repos = c(CRAN = 'https://cloud.r-project.org')); install.packages(c('data.table', 'jsonlite', 'DBI', 'RClickhouse', 'yaml', 'dbscan', 'isotree'))"
+RUN R -q -e "options(repos = c(CRAN = 'https://cran.rstudio.com')); install.packages(c('data.table', 'jsonlite', 'DBI', 'bit64', 'RClickhouse', 'yaml', 'dbscan', 'isotree'))"
 
 WORKDIR /app
 COPY R /app/R

@@ -152,10 +152,18 @@ fetch_src_window_features <- function(conn, window_minutes = 5L) {
       max(ifNull(duration_sec, 0)) AS max_duration_sec,
       sum(toFloat64(ifNull(bytes_total, 0))) AS bytes_total_sum,
       sum(toFloat64(ifNull(packets_total, 0))) AS packets_total_sum,
-      avg(if(flow_state IN ('S0', 'REJ', 'RSTO', 'RSTR', 'SH', 'S1'), 1, 0)) AS failure_ratio,
+      avg(if(flow_state IN ('S0', 'REJ', 'RSTO', 'RSTR', 'SH', 'S1', 'INT', 'REQ', 'RST', 'CLO'), 1, 0)) AS failure_ratio,
       avg(if(dst_port IN (80, 443, 8000, 8080, 8443), 1, 0)) AS web_ratio,
       avg(if(dst_port = 445, 1, 0)) AS smb_ratio,
-      avg(if(dst_port IN (22, 23, 3389, 5900, 2323), 1, 0)) AS remote_admin_ratio
+      avg(if(dst_port IN (22, 23, 3389, 5900, 2323), 1, 0)) AS remote_admin_ratio,
+      count(CASE WHEN transport_proto = 'UDP' THEN 1 END) AS udp_flow_count,
+      count(CASE WHEN transport_proto = 'ICMP' THEN 1 END) AS icmp_flow_count,
+      avg(CASE WHEN transport_proto = 'UDP' THEN toFloat64(ifNull(bytes_total, 0)) ELSE NULL END) AS avg_udp_bytes,
+      avg(if(dst_port = 21, 1, 0)) AS ftp_ratio,
+      avg(if(dst_port = 22, 1, 0)) AS ssh_ratio,
+      avg(if(dst_port IN (25, 465, 587), 1, 0)) AS smtp_ratio,
+      avg(if(dst_port IN (3306, 5432, 1433, 27017, 6379), 1, 0)) AS db_ratio,
+      dateDiff('minute', min(flow_start), max(flow_start)) AS span_minutes
     FROM network_flows
     WHERE flow_start IS NOT NULL
       AND src_ip != ''
@@ -186,7 +194,11 @@ fetch_pair_features <- function(conn) {
       stddevPop(ifNull(bytes_total, 0)) AS bytes_stddev,
       sum(toFloat64(ifNull(packets_total, 0))) AS packets_total_sum,
       avg(toFloat64(ifNull(packets_total, 0))) AS avg_packets_total,
-      avg(if(flow_state IN ('S0', 'REJ', 'RSTO', 'RSTR', 'SH', 'S1'), 1, 0)) AS failure_ratio
+      avg(if(flow_state IN ('S0', 'REJ', 'RSTO', 'RSTR', 'SH', 'S1', 'INT', 'REQ', 'RST', 'CLO'), 1, 0)) AS failure_ratio,
+      sum(toFloat64(ifNull(bytes_src, 0))) AS bytes_src_sum,
+      sum(toFloat64(ifNull(bytes_dst, 0))) AS bytes_dst_sum,
+      if(sum(bytes_dst) > 0, sum(bytes_src) / sum(bytes_dst), 0) AS src_dst_byte_ratio,
+      uniqExact(src_port) AS uniq_src_ports
     FROM network_flows
     WHERE flow_start IS NOT NULL
       AND src_ip != ''
@@ -282,4 +294,33 @@ fetch_events_for_pair_detection <- function(conn, src_ip, dst_ip, dst_port, tran
 
 close_connection <- function(conn) {
   tryCatch(DBI::dbDisconnect(conn), error = function(e) invisible(NULL))
+}
+
+fetch_exfil_candidates <- function(conn) {
+  sql <- "
+    SELECT
+      src_ip,
+      dst_ip,
+      dst_port,
+      transport_proto,
+      any(app_proto) AS app_proto,
+      count() AS flow_count,
+      sum(toFloat64(ifNull(bytes_src, 0))) AS bytes_src_sum,
+      sum(toFloat64(ifNull(bytes_dst, 0))) AS bytes_dst_sum,
+      min(flow_start) AS first_seen,
+      max(flow_end) AS last_seen,
+      if(sum(bytes_dst) > 0, sum(bytes_src) / sum(bytes_dst), 99999) AS src_dst_ratio
+    FROM network_flows
+    WHERE flow_start IS NOT NULL
+      AND src_ip != ''
+      AND dst_ip != ''
+    GROUP BY src_ip, dst_ip, dst_port, transport_proto
+    HAVING sum(bytes_src) > 1048576
+      AND (sum(bytes_dst) = 0 OR sum(bytes_src) / sum(bytes_dst) > 5)
+      AND count() >= 3
+    ORDER BY bytes_src_sum DESC
+    LIMIT 10000
+  "
+
+  DBI::dbGetQuery(conn, sql)
 }

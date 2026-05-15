@@ -1,7 +1,7 @@
-title: Common C2 Listener Ports
-id: net-c2-common-listener-ports
+title: Known Backdoor or RAT Ports
+id: net-backdoor-known-ports
 status: experimental
-description: Detects TCP sessions to ports often reused by reverse shells or ad-hoc C2 listeners.
+description: Detects established TCP sessions on ports commonly used by backdoors and RAT tools.
 author: team
 logsource:
     category: network_connection
@@ -12,27 +12,26 @@ detection:
     selection_ports:
         dst_port:
             - 1234
-            - 1337
             - 2222
             - 4444
             - 5555
             - 6666
-            - 6667
             - 7777
             - 8888
             - 9999
             - 12345
             - 31337
-    selection_duration:
-        duration_sec|gte: 30
-    selection_bytes:
-        bytes_total|gte: 500
+            - 54321
+            - 65535
     selection_state:
         flow_state:
             - FIN
             - CON
-    condition: selection_proto and selection_ports and selection_duration and selection_bytes and selection_state
+    selection_duration:
+        duration_sec|gte: 5
+    condition: selection_proto and selection_ports and selection_state and selection_duration
 level: high
 tags:
     - attack.command-and-control
+    - attack.t1571
     - network

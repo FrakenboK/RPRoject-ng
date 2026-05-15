@@ -1,0 +1,28 @@
+title: Suspicious Large HTTP Upload
+id: net-http-large-upload
+status: experimental
+description: Detects large outbound data transfers over HTTP/HTTPS, potential data exfiltration.
+author: team
+logsource:
+    category: network_connection
+    product: idc
+detection:
+    selection_proto:
+        transport_proto: TCP
+    selection_ports:
+        dst_port:
+            - 80
+            - 443
+            - 8080
+    selection_bytes:
+        bytes_src|gte: 1048576
+    selection_state:
+        flow_state:
+            - FIN
+            - CON
+    condition: selection_proto and selection_ports and selection_bytes and selection_state
+level: medium
+tags:
+    - attack.exfiltration
+    - attack.t1041
+    - network

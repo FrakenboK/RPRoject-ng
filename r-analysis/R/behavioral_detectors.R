@@ -131,7 +131,8 @@ run_behavioral_analysis <- function(conn, analysis_run_id, window_minutes = 5L) 
     info(sprintf("Behavioral stage: %d source-window aggregate row(s) loaded", nrow(src_window)))
     numeric_window_cols <- c(
       "flow_count", "uniq_dst_ips", "uniq_dst_ports", "avg_duration_sec", "max_duration_sec",
-      "bytes_total_sum", "packets_total_sum", "failure_ratio", "web_ratio", "smb_ratio", "remote_admin_ratio"
+      "bytes_total_sum", "packets_total_sum", "failure_ratio", "web_ratio", "smb_ratio", "remote_admin_ratio",
+      "udp_flow_count", "icmp_flow_count", "ftp_ratio", "ssh_ratio", "smtp_ratio", "db_ratio"
     )
     for (col_name in numeric_window_cols) {
       src_window[[col_name]] <- normalize_score(src_window[[col_name]])
@@ -172,7 +173,8 @@ run_behavioral_analysis <- function(conn, analysis_run_id, window_minutes = 5L) 
     src_window_matrix <- prepare_feature_matrix(
       src_window_ml,
       c("flow_count", "uniq_dst_ips", "uniq_dst_ports", "avg_duration_sec", "max_duration_sec",
-        "bytes_total_sum", "packets_total_sum", "failure_ratio", "web_ratio", "smb_ratio", "remote_admin_ratio")
+        "bytes_total_sum", "packets_total_sum", "failure_ratio", "web_ratio", "smb_ratio", "remote_admin_ratio",
+        "udp_flow_count", "icmp_flow_count", "ftp_ratio", "ssh_ratio", "smtp_ratio", "db_ratio")
     )
 
     src_window_scores <- run_outlier_ensemble(src_window_matrix$data, min_pts = 10L)
@@ -281,6 +283,7 @@ run_behavioral_analysis <- function(conn, analysis_run_id, window_minutes = 5L) 
         )
       }
     }
+  }
 
     detector_name <- "dbscan_lof_isolation_forest"
     add_window_detections(
@@ -311,7 +314,27 @@ run_behavioral_analysis <- function(conn, analysis_run_id, window_minutes = 5L) 
       "high",
       "Повторяющиеся TCP-сессии к SMB с большим числом ошибок и аномальными частотными признаками."
     )
-  }
+
+    slow_scan <- if ("span_minutes" %in% names(src_window)) {
+      src_window[
+        span_minutes >= 10 &
+        uniq_dst_ports >= 10 &
+        flow_count >= 20 &
+        (flow_count / pmax(span_minutes, 1)) < 5 &
+        ensemble_score >= 0.75
+      ]
+    } else {
+      src_window[0L]
+    }
+
+    add_window_detections(
+      slow_scan,
+      "behavioral-slow-scan",
+      "Slow Rate Scan Candidate",
+      "medium",
+      "Распределённый по времени порт-скан с низкой частотой запросов."
+  )
+
 
   if (nrow(pair_features) > 0) {
     info(sprintf("Behavioral stage: %d src-dst aggregate row(s) loaded", nrow(pair_features)))
@@ -439,6 +462,231 @@ run_behavioral_analysis <- function(conn, analysis_run_id, window_minutes = 5L) 
           transport_proto = row$transport_proto[[1]]
         )
       }
+    }
+  }
+
+  udp_query <- "
+    SELECT
+      toStartOfInterval(flow_start, toIntervalMinute(5)) AS window_start,
+      src_ip,
+      count() AS flow_count,
+      uniqExact(dst_ip) AS uniq_dst_ips,
+      uniqExact(dst_port) AS uniq_dst_ports
+    FROM network_flows
+    WHERE flow_start IS NOT NULL
+      AND src_ip != ''
+      AND transport_proto = 'UDP'
+    GROUP BY window_start, src_ip
+    HAVING count() > 500 AND uniqExact(dst_ip) > 3
+    LIMIT 10000
+  "
+
+  udp_flood <- tryCatch(as.data.table(DBI::dbGetQuery(conn, udp_query)), error = function(e) data.table())
+  if (nrow(udp_flood) > 0) {
+    info(sprintf("Behavioral stage: %d UDP flood candidate row(s) detected", nrow(udp_flood)))
+
+    for (idx in seq_len(nrow(udp_flood))) {
+      row <- udp_flood[idx]
+      if (is.null(row) || nrow(row) == 0) next
+
+      detection_id <- build_detection_id(analysis_run_id)
+      entity_value <- sprintf("%s|%s", safe_character(row$src_ip[[1]]),
+        format(as.POSIXct(row$window_start[[1]], tz = "UTC"), "%Y-%m-%d %H:%M:%S"))
+
+      detections[[length(detections) + 1L]] <- data.frame(
+        detection_id = detection_id,
+        analysis_run_id = analysis_run_id,
+        detector_type = "behavioral",
+        detector_name = "udp_flood",
+        rule_id = "behavioral-udp-flood",
+        rule_name = "UDP Flood Candidate",
+        severity = "medium",
+        confidence_score = 0.8,
+        entity_type = "src_ip_window",
+        entity_value = entity_value,
+        src_ip = safe_character(row$src_ip[[1]]),
+        src_port = NA_integer_,
+        dst_ip = "",
+        dst_port = NA_integer_,
+        transport_proto = "UDP",
+        app_proto = "",
+        first_seen = as.POSIXct(row$window_start[[1]], tz = "UTC"),
+        last_seen = as.POSIXct(row$window_start[[1]], tz = "UTC") + as.difftime(5, units = "mins"),
+        flow_count = safe_numeric(row$flow_count[[1]]),
+        aggregation_key = entity_value,
+        title = "UDP Flood Candidate",
+        description = "Высокое число UDP-потоков от одного источника в одном временном окне.",
+        tags_json = safe_json(list("behavioral", "udp", "flood")),
+        detail_json = safe_json(list(
+          flow_count = safe_numeric(row$flow_count[[1]]),
+          uniq_dst_ips = safe_numeric(row$uniq_dst_ips[[1]]),
+          uniq_dst_ports = safe_numeric(row$uniq_dst_ports[[1]])
+        )),
+        created_at = Sys.time(),
+        stringsAsFactors = FALSE
+      )
+
+      events[[length(events) + 1L]] <- build_window_detection_events(
+        conn = conn,
+        analysis_run_id = analysis_run_id,
+        detection_id = detection_id,
+        rule_id = "behavioral-udp-flood",
+        detector_name = "udp_flood",
+        src_ip = safe_character(row$src_ip[[1]]),
+        window_start = as.POSIXct(row$window_start[[1]], tz = "UTC"),
+        window_minutes = 5L
+      )
+    }
+  }
+
+  ttl_query <- "
+    SELECT
+      src_ip,
+      count() AS flow_count,
+      uniqExact(src_ttl) AS uniq_src_ttl,
+      min(flow_start) AS first_seen,
+      max(flow_end) AS last_seen
+    FROM network_flows
+    WHERE src_ttl IS NOT NULL
+      AND src_ip != ''
+    GROUP BY src_ip
+    HAVING uniq_src_ttl > 2 AND count() >= 5
+    LIMIT 10000
+  "
+
+  ttl_anomalies <- tryCatch(DBI::dbGetQuery(conn, ttl_query), error = function(e) data.frame())
+  if (nrow(ttl_anomalies) > 0) {
+    info(sprintf("Behavioral stage: %d TTL anomaly row(s) detected", nrow(ttl_anomalies)))
+
+    for (idx in seq_len(nrow(ttl_anomalies))) {
+      tryCatch({
+        row <- ttl_anomalies[idx]
+        if (is.null(row) || nrow(row) == 0) next
+
+      detection_id <- build_detection_id(analysis_run_id)
+      entity_value <- safe_character(row$src_ip[[1]])
+
+      detections[[length(detections) + 1L]] <- data.frame(
+        detection_id = detection_id,
+        analysis_run_id = analysis_run_id,
+        detector_type = "behavioral",
+        detector_name = "ttl_anomaly",
+        rule_id = "behavioral-ttl-anomaly",
+        rule_name = "TTL Spoofing or Multi-OS Candidate",
+        severity = "low",
+        confidence_score = 0.7,
+        entity_type = "src_ip",
+        entity_value = entity_value,
+        src_ip = safe_character(row$src_ip[[1]]),
+        src_port = NA_integer_,
+        dst_ip = "",
+        dst_port = NA_integer_,
+        transport_proto = "",
+        app_proto = "",
+        first_seen = tryCatch(as.POSIXct(row$first_seen[[1]], tz = "UTC"), error = function(e) as.POSIXct(NA, tz = "UTC")),
+        last_seen = tryCatch(as.POSIXct(row$last_seen[[1]], tz = "UTC"), error = function(e) as.POSIXct(NA, tz = "UTC")),
+        flow_count = safe_numeric(row$flow_count[[1]]),
+        aggregation_key = entity_value,
+        title = "TTL Spoofing or Multi-OS Candidate",
+        description = "Источник использует несколько разных TTL значений.",
+        tags_json = safe_json(list("behavioral", "ttl", "spoofing")),
+        detail_json = safe_json(list(
+          uniq_src_ttl = safe_numeric(row$uniq_src_ttl[[1]]),
+          flow_count = safe_numeric(row$flow_count[[1]])
+        )),
+        created_at = Sys.time(),
+        stringsAsFactors = FALSE
+      )
+
+      events[[length(events) + 1L]] <- build_window_detection_events(
+        conn = conn,
+        analysis_run_id = analysis_run_id,
+        detection_id = detection_id,
+        rule_id = "behavioral-ttl-anomaly",
+        detector_name = "ttl_anomaly",
+        src_ip = safe_character(row$src_ip[[1]]),
+        window_start = tryCatch(as.POSIXct(row$first_seen[[1]], tz = "UTC"), error = function(e) as.POSIXct(NA, tz = "UTC")),
+        window_minutes = window_minutes
+      )
+      }, error = function(e) {
+        warning_log(sprintf("TTL detection row %d failed: %s", idx, e$message))
+      })
+    }
+  }
+
+  dns_query <- "
+    SELECT
+      src_ip,
+      count() AS flow_count,
+      avg(toFloat64(ifNull(bytes_total, 0))) AS avg_bytes_total,
+      min(flow_start) AS first_seen,
+      max(flow_end) AS last_seen
+    FROM network_flows
+    WHERE dst_port = 53
+      AND transport_proto = 'UDP'
+      AND src_ip != ''
+    GROUP BY src_ip
+    HAVING avg(toFloat64(ifNull(bytes_total, 0))) > 300 AND count() > 50
+    LIMIT 10000
+  "
+
+  dns_tunnels <- tryCatch(DBI::dbGetQuery(conn, dns_query), error = function(e) data.frame())
+  if (nrow(dns_tunnels) > 0) {
+    info(sprintf("Behavioral stage: %d DNS tunneling candidate row(s) detected", nrow(dns_tunnels)))
+
+    for (idx in seq_len(nrow(dns_tunnels))) {
+      tryCatch({
+        row <- dns_tunnels[idx]
+        if (is.null(row) || nrow(row) == 0) next
+
+      detection_id <- build_detection_id(analysis_run_id)
+      entity_value <- safe_character(row$src_ip[[1]])
+
+      detections[[length(detections) + 1L]] <- data.frame(
+        detection_id = detection_id,
+        analysis_run_id = analysis_run_id,
+        detector_type = "behavioral",
+        detector_name = "dns_tunneling",
+        rule_id = "behavioral-dns-tunneling",
+        rule_name = "DNS Tunneling Candidate",
+        severity = "high",
+        confidence_score = 0.8,
+        entity_type = "src_ip",
+        entity_value = entity_value,
+        src_ip = safe_character(row$src_ip[[1]]),
+        src_port = NA_integer_,
+        dst_ip = "",
+        dst_port = 53,
+        transport_proto = "UDP",
+        app_proto = "dns",
+        first_seen = tryCatch(as.POSIXct(row$first_seen[[1]], tz = "UTC"), error = function(e) as.POSIXct(NA, tz = "UTC")),
+        last_seen = tryCatch(as.POSIXct(row$last_seen[[1]], tz = "UTC"), error = function(e) as.POSIXct(NA, tz = "UTC")),
+        flow_count = safe_numeric(row$flow_count[[1]]),
+        aggregation_key = entity_value,
+        title = "DNS Tunneling Candidate",
+        description = "Высокий объём данных через DNS при большом числе запросов.",
+        tags_json = safe_json(list("behavioral", "dns", "tunneling")),
+        detail_json = safe_json(list(
+          avg_bytes_total = safe_numeric(row$avg_bytes_total[[1]]),
+          flow_count = safe_numeric(row$flow_count[[1]])
+        )),
+        created_at = Sys.time(),
+        stringsAsFactors = FALSE
+      )
+
+      events[[length(events) + 1L]] <- build_window_detection_events(
+        conn = conn,
+        analysis_run_id = analysis_run_id,
+        detection_id = detection_id,
+        rule_id = "behavioral-dns-tunneling",
+        detector_name = "dns_tunneling",
+        src_ip = safe_character(row$src_ip[[1]]),
+        window_start = tryCatch(as.POSIXct(row$first_seen[[1]], tz = "UTC"), error = function(e) as.POSIXct(NA, tz = "UTC")),
+        window_minutes = window_minutes
+      )
+      }, error = function(e) {
+        warning_log(sprintf("DNS detection row %d failed: %s", idx, e$message))
+      })
     }
   }
 
