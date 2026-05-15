@@ -1,0 +1,21 @@
+title: ICMP Flood or Sweep Candidate
+id: net-icmp-flood
+status: experimental
+description: Detects high-volume ICMP traffic in short time windows, potential ICMP flood or network sweep.
+author: team
+logsource:
+    category: network_connection
+    product: idc
+detection:
+    selection_proto:
+        transport_proto: ICMP
+    selection_packets:
+        packets_total|gte: 100
+    selection_duration:
+        duration_sec|lte: 10
+    condition: selection_proto and selection_packets and selection_duration
+level: medium
+tags:
+    - attack.impact
+    - attack.t1498
+    - network

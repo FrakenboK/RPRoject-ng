@@ -1,0 +1,28 @@
+title: Suspicious SMTP Traffic
+id: net-smtp-suspicious
+status: experimental
+description: Detects SMTP sessions with large data transfers, potential spam or data exfiltration via email.
+author: team
+logsource:
+    category: network_connection
+    product: idc
+detection:
+    selection_proto:
+        transport_proto: TCP
+    selection_ports:
+        dst_port:
+            - 25
+            - 465
+            - 587
+    selection_bytes:
+        bytes_total|gte: 5000
+    selection_state:
+        flow_state:
+            - FIN
+            - CON
+    condition: selection_proto and selection_ports and selection_bytes and selection_state
+level: low
+tags:
+    - attack.exfiltration
+    - attack.t1048
+    - network

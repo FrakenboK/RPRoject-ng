@@ -148,6 +148,17 @@ normalize_transport_proto <- function(value) {
   value_chr
 }
 
+derive_zeek_direction <- function(local_orig, local_resp) {
+  local_orig <- as.logical(local_orig)
+  local_resp <- as.logical(local_resp)
+  result <- rep("external", length(local_orig))
+  result[is.na(local_orig) | is.na(local_resp)] <- ""
+  result[local_orig & !local_resp] <- "outbound"
+  result[!local_orig & local_resp] <- "inbound"
+  result[local_orig & local_resp] <- "internal"
+  result
+}
+
 detect_ip_version <- function(src_ip, dst_ip) {
   probe <- ifelse(nzchar(src_ip), src_ip, dst_ip)
   ifelse(grepl(":", probe, fixed = TRUE), "ipv6", "ipv4")

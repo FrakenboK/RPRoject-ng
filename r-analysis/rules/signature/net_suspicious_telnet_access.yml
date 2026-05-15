@@ -2,7 +2,7 @@ title: Telnet Failed Access Candidate
 id: net-suspicious-telnet-access
 status: experimental
 description: Detects failed TCP connection attempts to Telnet administration ports.
-author: Codex
+author: team
 logsource:
     category: network_connection
     product: idc
@@ -15,10 +15,10 @@ detection:
             - 2323
     selection_state:
         flow_state:
-            - S0
-            - RSTO
-            - RSTR
-            - RSTOS0
+            - INT
+            - REQ
+            - RST
+            - CLO
     condition: selection_proto and selection_ports and selection_state
 level: medium
 tags:

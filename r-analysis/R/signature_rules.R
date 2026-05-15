@@ -128,6 +128,10 @@ build_scalar_sql <- function(column_name, value, modifier) {
     return(sprintf("isIPAddressInRange(%s, %s)", column_name, quote_sql_string(value)))
   }
 
+  if (modifier == "between") {
+    return(sprintf("%s BETWEEN %s AND %s", column_name, as.character(value[[1]]), as.character(value[[2]])))
+  }
+
   stop(sprintf("Unsupported Sigma modifier: %s", modifier))
 }
 

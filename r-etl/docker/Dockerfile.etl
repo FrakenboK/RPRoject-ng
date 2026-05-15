@@ -29,7 +29,7 @@ RUN curl -fsSL https://download.opensuse.org/repositories/security:zeek/xUbuntu_
     && apt-get install -y --no-install-recommends zeek \
     && rm -rf /var/lib/apt/lists/*
 
-RUN R -q -e "options(repos = c(CRAN = 'https://cloud.r-project.org')); install.packages(c('data.table', 'jsonlite', 'DBI', 'RClickhouse'))"
+RUN R -q -e "options(repos = c(CRAN = 'https://cran.rstudio.com')); install.packages(c('data.table', 'jsonlite', 'DBI', 'bit64', 'RClickhouse'))"
 
 WORKDIR /app
 COPY R /app/R

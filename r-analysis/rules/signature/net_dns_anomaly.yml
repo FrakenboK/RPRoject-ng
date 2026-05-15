@@ -1,0 +1,20 @@
+title: DNS Anomaly Candidate
+id: net-dns-anomaly
+status: experimental
+description: Detects anomalous DNS traffic with large packet sizes, potential DNS amplification or tunneling via DNS.
+author: team
+logsource:
+    category: network_connection
+    product: idc
+detection:
+    selection_proto:
+        transport_proto: UDP
+        dst_port: 53
+    selection_size:
+        bytes_total|gte: 512
+    condition: selection_proto and selection_size
+level: medium
+tags:
+    - attack.exfiltration
+    - attack.t1048
+    - network

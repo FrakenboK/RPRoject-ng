@@ -1,7 +1,7 @@
-title: SMB Failed Access Candidate
-id: net-smb-failed-access
+title: SSH Brute Force Candidate
+id: net-ssh-brute-force
 status: experimental
-description: Detects failed TCP sessions to SMB that can indicate probing or authentication abuse.
+description: Detects TCP sessions to SSH with failure-like connection states, indicating brute force or probing attempts.
 author: team
 logsource:
     category: network_connection
@@ -9,16 +9,15 @@ logsource:
 detection:
     selection_proto:
         transport_proto: TCP
-        dst_port: 445
+        dst_port: 22
     selection_state:
         flow_state:
             - INT
             - REQ
             - RST
-            - CLO
     condition: selection_proto and selection_state
-level: medium
+level: high
 tags:
-    - attack.discovery
-    - attack.t1046
+    - attack.credential-access
+    - attack.t1110
     - network

@@ -180,3 +180,55 @@ choose_handler <- function(source_key, local_path) {
 
   "unsupported"
 }
+
+list_local_objects <- function(data_dir) {
+  if (!dir.exists(data_dir)) {
+    warning_log(sprintf("Local data directory does not exist: %s", data_dir))
+    return(data.frame(
+      bucket = character(),
+      key = character(),
+      size = numeric(),
+      last_modified = character(),
+      etag = character(),
+      dataset_name = character(),
+      extension = character(),
+      stringsAsFactors = FALSE
+    ))
+  }
+
+  files <- list.files(data_dir, recursive = TRUE, full.names = FALSE)
+  if (length(files) == 0) {
+    return(data.frame(
+      bucket = character(),
+      key = character(),
+      size = numeric(),
+      last_modified = character(),
+      etag = character(),
+      dataset_name = character(),
+      extension = character(),
+      stringsAsFactors = FALSE
+    ))
+  }
+
+  file_paths <- file.path(data_dir, files)
+  file_info <- file.info(file_paths)
+
+  data.frame(
+    bucket = "local",
+    key = files,
+    size = file_info$size,
+    last_modified = format(file_info$mtime, "%Y-%m-%dT%H:%M:%S"),
+    etag = "",
+    dataset_name = vapply(files, infer_source_dataset, character(1)),
+    extension = vapply(files, infer_extension, character(1)),
+    local_path = file_paths,
+    stringsAsFactors = FALSE
+  )
+}
+
+get_local_file_path <- function(local_object) {
+  if ("local_path" %in% names(local_object) && nzchar(local_object$local_path)) {
+    return(local_object$local_path)
+  }
+  file.path(Sys.getenv("LOCAL_DATA_DIR", "."), local_object$key)
+}
