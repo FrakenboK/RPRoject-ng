@@ -96,8 +96,54 @@ fetch_flows_by_day <- function() {
     SELECT toDate(flow_start) AS day, count() AS flows
     FROM network_flows
     WHERE flow_start IS NOT NULL
+      AND flow_start >= toDateTime('2000-01-01 00:00:00')
     GROUP BY day
     ORDER BY day
+  ")
+}
+
+fetch_flows_by_bucket <- function(granularity = "day", date_from = NULL, date_to = NULL) {
+  bucket_expr <- switch(
+    granularity,
+    "day" = "toDate(flow_start)",
+    "week" = "toMonday(flow_start)",
+    "month" = "toStartOfMonth(flow_start)",
+    "toDate(flow_start)"
+  )
+
+  conditions <- c(
+    "flow_start IS NOT NULL",
+    "flow_start >= toDateTime('2000-01-01 00:00:00')"
+  )
+
+  if (!is.null(date_from)) {
+    conditions <- c(conditions, sprintf("flow_start >= toDateTime(%s)",
+      quote_sql(format(as.POSIXct(date_from, tz = "UTC"), "%Y-%m-%d 00:00:00"))))
+  }
+  if (!is.null(date_to)) {
+    conditions <- c(conditions, sprintf("flow_start <= toDateTime(%s)",
+      quote_sql(format(as.POSIXct(date_to, tz = "UTC"), "%Y-%m-%d 23:59:59"))))
+  }
+
+  where_clause <- paste(conditions, collapse = " AND ")
+
+  safe_query(sprintf("
+    SELECT %s AS bucket, count() AS flows
+    FROM network_flows
+    WHERE %s
+    GROUP BY bucket
+    ORDER BY bucket
+  ", bucket_expr, where_clause))
+}
+
+fetch_flow_time_range <- function() {
+  safe_query("
+    SELECT
+      min(flow_start) AS min_ts,
+      max(flow_start) AS max_ts
+    FROM network_flows
+    WHERE flow_start IS NOT NULL
+      AND flow_start >= toDateTime('2000-01-01 00:00:00')
   ")
 }
 
