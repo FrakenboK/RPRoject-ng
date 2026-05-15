@@ -1,46 +1,45 @@
 # R ETL Init-Container
 
-ETL-пайплайн на `R`, который:
+ETL-модуль на `R` для загрузки сетевых данных из `S3`, нормализации в единую
+схему и записи в `ClickHouse`.
 
-- листит все объекты в `S3` по заданному префиксу;
-- скачивает каждый файл без хардкода имён;
-- выбирает обработчик по типу файла;
-- приводит сетевые данные к единой схеме `network_flows`;
-- загружает результат в `ClickHouse`.
-- проходит полный запуск через корневой `docker compose`
+## Что делает
+
+- листит все объекты в `S3` по префиксу
+- скачивает все найденные файлы без хардкода имён
+- выбирает обработчик по формату файла
+- приводит данные к единой таблице `network_flows`
+- пишет журнал обработки в `etl_objects`
 
 ## Поддержанные форматы
 
-- `pcap` / `pcapng` → разбираются через `Zeek` (`conn.log`)
+- `pcap`
+- `pcapng`
 - `binetflow`
-- `csv` (`UNSW-NB15` и generic CSV с колонками src/dst/proto)
-- `zip` (`Kyoto 2006+` и архивы с поддержанными вложенными файлами)
+- `csv`
+- `zip`
 
-Проверено на:
+Обработка:
 
-- `Kyoto 2006+`
-- `UNSW-NB15`
-- `Stratosphere IPS`
+- `pcap` / `pcapng` — через `Zeek`
+- `binetflow` — прямой парсинг
+- `csv` — `UNSW-NB15` и generic flow CSV
+- `zip` — обход вложенных поддержанных файлов
 
 ## Формирование сессий
 
-- `pcap` / `pcapng` разбираются через `Zeek`
-- каждая запись `conn.log` загружается как одна запись в `network_flows`
-- `flow_start` берётся из `ts`, `flow_end` вычисляется по `duration`
-- `Kyoto`, `UNSW-NB15` и `BinetFlow` нормализуются из уже готовых flow/session
-  записей
+- `pcap` / `pcapng` ETL передаёт в `Zeek`
+- ETL читает `conn.log`
+- одна запись `conn.log` загружается как одна запись в `network_flows`
+- `flow_start` берётся из `ts`
+- `flow_end` вычисляется по `duration_sec`
+- `Kyoto`, `UNSW-NB15` и `BinetFlow` нормализуются из готовых flow/session записей
 
-## Единая схема
+## Поддержанные датасеты
 
-Все источники сводятся в таблицу `network_flows` с общими полями:
-
-- источник и provenance (`source_dataset`, `source_key`, `handler_name`)
-- время потока (`flow_start`, `flow_end`, `duration_sec`)
-- адреса и порты (`src_ip`, `src_port`, `dst_ip`, `dst_port`)
-- протоколы и состояние (`transport_proto`, `app_proto`, `flow_state`)
-- объёмы и пакеты (`bytes_*`, `packets_*`)
-- label/attack metadata (`source_label`, `attack_category`, `is_malicious`)
-- `attributes_json` для dataset-specific признаков
+- `UNSW-NB15`
+- `Stratosphere IPS`
+- `Kyoto 2006+`
 
 ## Таблицы
 
@@ -54,8 +53,3 @@ cd ..
 cp .env.example .env
 docker compose up --build etl-init
 ```
-
-После завершения `etl-init` данные будут в таблицах:
-
-- `network_flows`
-- `etl_objects`

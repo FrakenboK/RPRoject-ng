@@ -32,5 +32,23 @@ services:
       TZ: ${TZ:-UTC}
     restart: "no"
 
+  analysis:
+    build:
+      context: ./r-analysis
+      dockerfile: docker/Dockerfile.analysis
+    platform: linux/amd64
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+    env_file:
+      - .env
+    environment:
+      CLICKHOUSE_HOST: clickhouse
+      CLICKHOUSE_PORT: 9000
+      SIGMA_RULES_DIR: /app/rules/signature
+      ANALYSIS_WINDOW_MINUTES: ${ANALYSIS_WINDOW_MINUTES:-5}
+      TZ: ${TZ:-UTC}
+    restart: "no"
+
 volumes:
   clickhouse_data:

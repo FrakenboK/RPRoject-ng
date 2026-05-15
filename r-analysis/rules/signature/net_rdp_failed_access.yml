@@ -1,0 +1,24 @@
+title: RDP Failed Access Candidate
+id: net-rdp-failed-access
+status: experimental
+description: Detects repeated TCP connection attempts to RDP with failure-like connection states.
+author: Codex
+logsource:
+    category: network_connection
+    product: idc
+detection:
+    selection_proto:
+        transport_proto: TCP
+        dst_port: 3389
+    selection_state:
+        flow_state:
+            - S0
+            - REJ
+            - RSTO
+            - RSTR
+    condition: selection_proto and selection_state
+level: medium
+tags:
+    - attack.lateral-movement
+    - attack.t1110
+    - network
