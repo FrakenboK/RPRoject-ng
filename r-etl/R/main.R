@@ -1,109 +1,133 @@
 source("R/utils.R")
+source("R/normalization.R")
 source("R/s3_io.R")
 source("R/parsing.R")
-source("R/normalization.R")
-source("R/clickhouse_io.R")
 source("R/tcp_sessions.R")
+source("R/clickhouse_io.R")
 
-run_etl_pipeline <- function(s3_bucket_url, item_name) {
-  info("Starting ETL pipeline")
-  info(sprintf("S3 Bucket: %s", s3_bucket_url))
-  info(sprintf("Item: %s", item_name))
+process_source_object <- function(conn, source_object, ingest_run_id, staging_dir) {
+  local_path <- download_s3_object(
+    bucket = source_object$bucket,
+    key = source_object$key,
+    destination_root = staging_dir
+  )
 
-  json_data <- tryCatch({
-    info("Fetching data from S3")
-    get_s3_item(s3_bucket_url, item_name)
-  }, error = function(e) {
-    error_log(sprintf("Failed to fetch data from S3: %s", e$message))
-    stop(e)
-  })
+  handler <- choose_handler(source_object$key, local_path)
+  if (identical(handler, "unsupported")) {
+    warning_log(sprintf("Skipping unsupported object: %s", source_object$key))
+    insert_etl_object_status(conn, build_object_status_row(
+      ingest_run_id = ingest_run_id,
+      source_object = source_object,
+      handler_name = "unsupported",
+      status = "skipped",
+      records_loaded = 0,
+      message = "Unsupported file type"
+    ))
+    return(invisible(NULL))
+  }
 
-  parsed_data <- tryCatch({
-    info("Parsing JSON data")
-    parse_captipper_json(json_data)
-  }, error = function(e) {
-    error_log(sprintf("Failed to parse JSON data: %s", e$message))
-    stop(e)
-  })
+  info(sprintf("Processing %s with handler %s", source_object$key, handler))
 
-  normalized_data <- tryCatch({
-    info("Normalizing parsed data")
-    normalize_parsed_data(parsed_data)
-  }, error = function(e) {
-    error_log(sprintf("Failed to normalize data: %s", e$message))
-    stop(e)
-  })
+  if (handler == "zip") {
+    rows_loaded <- process_zip_archive_into_clickhouse(
+      conn = conn,
+      path = local_path,
+      source_object = source_object,
+      ingest_run_id = ingest_run_id
+    )
+  } else {
+    flows <- switch(
+      handler,
+      pcap_zeek = parse_pcap_with_zeek(local_path, source_object, ingest_run_id, staging_dir),
+      binetflow = parse_binetflow_file(local_path, source_object, ingest_run_id),
+      csv = parse_csv_file(local_path, source_object, ingest_run_id),
+      stop(sprintf("Unsupported handler: %s", handler))
+    )
 
-  # Опциональный шаг: загрузка TCP-сессий из Zeek conn.log (NDJSON) в S3.
-  conn_log_prefix <- Sys.getenv("S3_CONN_LOG_PREFIX", "")
-  if (nchar(conn_log_prefix) > 0) {
-    normalized_data$tcp_sessions <- tryCatch({
-      info(sprintf("Fetching Zeek conn.log: %s", conn_log_prefix))
-      records <- get_s3_ndjson(s3_bucket_url, conn_log_prefix)
-      info(sprintf("Loaded %d conn.log record(s)", length(records)))
-      normalize_tcp_sessions(parse_zeek_conn_log(records))
+    if (nrow(flows) > 0) {
+      insert_network_flows(conn, flows)
+    } else {
+      warning_log(sprintf("Handler %s produced zero rows for %s", handler, source_object$key))
+    }
+
+    rows_loaded <- nrow(flows)
+  }
+
+  insert_etl_object_status(conn, build_object_status_row(
+    ingest_run_id = ingest_run_id,
+    source_object = source_object,
+    handler_name = handler,
+    status = "loaded",
+    records_loaded = rows_loaded,
+    message = ""
+  ))
+
+  invisible(rows_loaded)
+}
+
+run_etl_pipeline <- function() {
+  config <- get_runtime_config()
+  init_runtime_dirs(config$staging_dir)
+
+  ingest_run_id <- build_ingest_run_id()
+  info(sprintf("Starting ETL init-container run: %s", ingest_run_id))
+  info(sprintf("S3 bucket: %s | prefix: %s", config$s3_bucket, config$s3_prefix))
+
+  source_objects <- list_s3_objects(config$s3_bucket, config$s3_prefix)
+  source_objects <- filter_source_objects(source_objects)
+
+  if (nrow(source_objects) == 0) {
+    warning_log("No source objects found in S3 prefix")
+    return(invisible(NULL))
+  }
+
+  info(sprintf("Discovered %d object(s) in bucket", nrow(source_objects)))
+
+  conn <- get_clickhouse_connection()
+  on.exit(close_connection(conn), add = TRUE)
+
+  if (!test_connection(conn)) {
+    stop("ClickHouse connection test failed")
+  }
+
+  create_all_tables(conn)
+
+  failures <- character(0)
+
+  for (row_idx in seq_len(nrow(source_objects))) {
+    source_object <- source_objects[row_idx, , drop = FALSE]
+
+    tryCatch({
+      process_source_object(conn, source_object, ingest_run_id, config$staging_dir)
     }, error = function(e) {
-      warning_log(sprintf("Skipping TCP sessions: %s", e$message))
-      empty_tcp_sessions_df()
+      failures <<- c(failures, source_object$key)
+      error_log(sprintf("Failed to process %s: %s", source_object$key, e$message))
+
+      insert_etl_object_status(conn, build_object_status_row(
+        ingest_run_id = ingest_run_id,
+        source_object = source_object,
+        handler_name = choose_handler(source_object$key, source_object$key),
+        status = "failed",
+        records_loaded = 0,
+        message = e$message
+      ))
     })
   }
 
-  conn <- tryCatch({
-    info("Connecting to ClickHouse")
-    get_clickhouse_connection()
-  }, error = function(e) {
-    error_log(sprintf("Failed to connect to ClickHouse: %s", e$message))
-    stop(e)
-  })
+  if (length(failures) > 0) {
+    stop(sprintf(
+      "ETL finished with %d failed object(s): %s",
+      length(failures),
+      paste(failures, collapse = ", ")
+    ))
+  }
 
-  tryCatch({
-    if (!test_connection(conn)) {
-      stop("ClickHouse connection test failed")
-    }
-
-    info("Creating tables")
-    create_all_tables(conn)
-
-    info("Inserting normalized data")
-    insert_normalized_data(conn, normalized_data)
-
-    info("ETL pipeline completed successfully")
-  }, error = function(e) {
-    error_log(sprintf("ETL pipeline failed: %s", e$message))
-    stop(e)
-  }, finally = {
-    close_connection(conn)
-  })
-
-  invisible(normalized_data)
+  info("ETL pipeline completed successfully")
+  invisible(NULL)
 }
 
 main <- function() {
-  args <- commandArgs(trailingOnly = TRUE)
-
-  # Поддерживаем два режима запуска:
-  # 1. Через аргументы командной строки: Rscript main.R <s3_bucket_url> <item_name>
-  # 2. Через env-переменные S3_ENDPOINT_URL и S3_PREFIX (Docker-режим)
-  if (length(args) >= 2) {
-    s3_bucket_url <- args[1]
-    item_name <- args[2]
-  } else {
-    s3_bucket_url <- Sys.getenv("S3_ENDPOINT_URL", "")
-    item_name <- Sys.getenv("S3_PREFIX", "dump.json")
-
-    if (nchar(s3_bucket_url) == 0) {
-      error_log("No S3 source configured. Set S3_ENDPOINT_URL and S3_PREFIX env vars, or pass args: Rscript main.R <s3_bucket_url> <item_name>")
-      stop("Missing S3 configuration")
-    }
-
-    # если S3_PREFIX пустой — берём последний сегмент URL как имя файла
-    if (nchar(item_name) == 0) {
-      item_name <- basename(s3_bucket_url)
-      if (nchar(item_name) == 0) item_name <- "dump.json"
-    }
-  }
-
-  run_etl_pipeline(s3_bucket_url, item_name)
+  run_etl_pipeline()
 }
 
 if (!interactive()) {

@@ -1,316 +1,216 @@
-library(yaml)
-library(stringr)
+library(data.table)
 
-load_schema <- function(schema_path = "config/schema.yml") {
-  tryCatch({
-    yaml::read_yaml(schema_path)
-  }, error = function(e) {
-    stop(sprintf("Failed to load schema: %s", e$message))
-  })
+UNIFIED_FLOW_COLUMNS <- c(
+  "event_id",
+  "ingest_run_id",
+  "source_dataset",
+  "source_key",
+  "source_file_name",
+  "source_format",
+  "handler_name",
+  "source_record_index",
+  "flow_id",
+  "flow_start",
+  "flow_end",
+  "duration_sec",
+  "src_ip",
+  "src_port",
+  "dst_ip",
+  "dst_port",
+  "ip_version",
+  "transport_proto",
+  "app_proto",
+  "flow_state",
+  "direction",
+  "packets_total",
+  "packets_src",
+  "packets_dst",
+  "bytes_total",
+  "bytes_src",
+  "bytes_dst",
+  "src_ttl",
+  "dst_ttl",
+  "rtt_sec",
+  "synack_sec",
+  "ackdat_sec",
+  "source_label",
+  "attack_category",
+  "is_malicious",
+  "attributes_json"
+)
+
+empty_network_flows <- function() {
+  data.frame(
+    event_id = character(),
+    ingest_run_id = character(),
+    source_dataset = character(),
+    source_key = character(),
+    source_file_name = character(),
+    source_format = character(),
+    handler_name = character(),
+    source_record_index = integer(),
+    flow_id = character(),
+    flow_start = as.POSIXct(character(), tz = "UTC"),
+    flow_end = as.POSIXct(character(), tz = "UTC"),
+    duration_sec = numeric(),
+    src_ip = character(),
+    src_port = integer(),
+    dst_ip = character(),
+    dst_port = integer(),
+    ip_version = character(),
+    transport_proto = character(),
+    app_proto = character(),
+    flow_state = character(),
+    direction = character(),
+    packets_total = numeric(),
+    packets_src = numeric(),
+    packets_dst = numeric(),
+    bytes_total = numeric(),
+    bytes_src = numeric(),
+    bytes_dst = numeric(),
+    src_ttl = integer(),
+    dst_ttl = integer(),
+    rtt_sec = numeric(),
+    synack_sec = numeric(),
+    ackdat_sec = numeric(),
+    source_label = character(),
+    attack_category = character(),
+    is_malicious = logical(),
+    attributes_json = character(),
+    stringsAsFactors = FALSE
+  )
 }
 
-normalize_ipv4 <- function(ip) {
-  if (is.null(ip) || is.na(ip) || nchar(as.character(ip)) == 0) {
-    return(NA_character_)
-  }
-
-  ip <- as.character(ip)
-  ip <- trimws(ip)
-
-  if (!grepl("^((25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\\.){3}(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)$", ip)) {
-    return(NA_character_)
-  }
-
-  return(ip)
+make_event_ids <- function(source_key, n) {
+  paste0(gsub("[^A-Za-z0-9_./-]", "_", source_key), "#", seq_len(n))
 }
 
-normalize_port <- function(port) {
-  if (is.null(port)) return(NA_integer_)
-  port_num <- suppressWarnings(as.integer(port))
-  port_num[is.na(port_num) | port_num < 0L | port_num > 65535L] <- NA_integer_
-  port_num
-}
-
-normalize_protocol <- function(protocol) {
-  if (is.null(protocol) || is.na(protocol) || nchar(as.character(protocol)) == 0) {
-    return(NA_character_)
+base_unified_frame <- function(n, source_object, ingest_run_id, handler_name, source_format = NULL) {
+  if (n == 0) {
+    return(empty_network_flows())
   }
 
-  protocol <- toupper(trimws(as.character(protocol)))
-  valid_protocols <- c("TCP", "UDP", "ICMP")
-
-  if (!protocol %in% valid_protocols) {
-    return(NA_character_)
-  }
-
-  return(protocol)
-}
-
-normalize_direction <- function(direction) {
-  if (is.null(direction) || is.na(direction) || nchar(as.character(direction)) == 0) {
-    return(NA_character_)
-  }
-
-  direction <- toupper(trimws(as.character(direction)))
-  valid_directions <- c("IN", "OUT", "INTERNAL")
-
-  if (!direction %in% valid_directions) {
-    return(NA_character_)
-  }
-
-  return(direction)
-}
-
-normalize_application <- function(app) {
-  if (is.null(app) || is.na(app) || nchar(as.character(app)) == 0) {
-    return(NA_character_)
-  }
-
-  app <- toupper(trimws(as.character(app)))
-  valid_apps <- c("HTTP", "HTTPS", "DNS", "SSH", "FTP", "SMTP", "IMAP", "POP3", "RDP", "SMB", "UNKNOWN")
-
-  if (!app %in% valid_apps) {
-    return("UNKNOWN")
-  }
-
-  return(app)
-}
-
-normalize_timestamp_single <- function(timestamp) {
-  if (is.null(timestamp) || length(timestamp) == 0) return(as.POSIXct(NA, tz = "UTC"))
-  if (length(timestamp) > 1) timestamp <- timestamp[[1]]
-  if (is.na(timestamp)) return(as.POSIXct(NA, tz = "UTC"))
-
-  ts_str <- trimws(as.character(timestamp))
-  if (nchar(ts_str) == 0 || ts_str == "NA") return(as.POSIXct(NA, tz = "UTC"))
-
-  if (inherits(timestamp, "POSIXct")) return(as.POSIXct(timestamp, tz = "UTC"))
-
-  formats <- c(
-    "%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S",
-    "%Y-%m-%d %H:%M:%OS", "%Y-%m-%dT%H:%M:%OS",
-    "%Y-%m-%d %H:%M:%S%z", "%Y-%m-%dT%H:%M:%S%z",
-    "%m/%d/%y %H:%M:%S", "%m/%d/%Y %H:%M:%S",
-    "%d/%m/%y %H:%M:%S", "%d/%m/%Y %H:%M:%S"
+  frame <- data.frame(
+    event_id = make_event_ids(source_object$key, n),
+    ingest_run_id = rep(ingest_run_id, n),
+    source_dataset = rep(source_object$dataset_name, n),
+    source_key = rep(source_object$key, n),
+    source_file_name = rep(basename(source_object$key), n),
+    source_format = rep(source_format %||% source_object$extension, n),
+    handler_name = rep(handler_name, n),
+    source_record_index = seq_len(n),
+    flow_id = rep("", n),
+    flow_start = as.POSIXct(rep(NA_real_, n), origin = "1970-01-01", tz = "UTC"),
+    flow_end = as.POSIXct(rep(NA_real_, n), origin = "1970-01-01", tz = "UTC"),
+    duration_sec = rep(NA_real_, n),
+    src_ip = rep("", n),
+    src_port = rep(NA_integer_, n),
+    dst_ip = rep("", n),
+    dst_port = rep(NA_integer_, n),
+    ip_version = rep("", n),
+    transport_proto = rep("", n),
+    app_proto = rep("", n),
+    flow_state = rep("", n),
+    direction = rep("", n),
+    packets_total = rep(NA_real_, n),
+    packets_src = rep(NA_real_, n),
+    packets_dst = rep(NA_real_, n),
+    bytes_total = rep(NA_real_, n),
+    bytes_src = rep(NA_real_, n),
+    bytes_dst = rep(NA_real_, n),
+    src_ttl = rep(NA_integer_, n),
+    dst_ttl = rep(NA_integer_, n),
+    rtt_sec = rep(NA_real_, n),
+    synack_sec = rep(NA_real_, n),
+    ackdat_sec = rep(NA_real_, n),
+    source_label = rep("", n),
+    attack_category = rep("", n),
+    is_malicious = rep(NA, n),
+    attributes_json = rep("{}", n),
+    stringsAsFactors = FALSE
   )
 
-  for (fmt in formats) {
-    parsed <- tryCatch(
-      as.POSIXct(strptime(ts_str, fmt, tz = "UTC"), tz = "UTC"),
-      error = function(e) as.POSIXct(NA, tz = "UTC")
-    )
-    if (!is.na(parsed)) return(parsed)
-  }
-
-  as.POSIXct(NA, tz = "UTC")
+  frame
 }
 
-# Векторизованная обёртка — работает и с одним значением, и с вектором
-normalize_timestamp <- function(timestamp) {
-  if (is.null(timestamp)) return(as.POSIXct(NA, tz = "UTC"))
-  if (length(timestamp) == 1) return(normalize_timestamp_single(timestamp))
-  result <- as.POSIXct(sapply(timestamp, function(x) {
-    as.numeric(normalize_timestamp_single(x))
-  }), origin = "1970-01-01", tz = "UTC")
+infer_attack_category <- function(labels) {
+  labels_chr <- tolower(trimws(safe_character(labels)))
+  result <- rep("", length(labels_chr))
+  result[grepl("botnet|malware|attack|exploit", labels_chr)] <- "malicious"
+  result[grepl("background|normal|benign", labels_chr)] <- "benign"
   result
 }
 
-normalize_uint16 <- function(value) {
-  if (is.null(value)) return(NA_integer_)
-  val <- suppressWarnings(as.integer(value))
-  val[is.na(val) | val < 0L | val > 65535L] <- NA_integer_
-  val
-}
-
-normalize_uint32 <- function(value) {
-  if (is.null(value)) return(NA_integer_)
-  val <- suppressWarnings(as.integer(value))
-  # R integer макс 2^31-1, для uint32 допускаем отрицательные только если overflow
-  val[is.na(val) | val < 0L] <- NA_integer_
-  val
-}
-
-normalize_uint64 <- function(value) {
-  if (is.null(value)) return(NA_real_)
-  val <- suppressWarnings(as.numeric(value))
-  val[is.na(val) | val < 0] <- NA_real_
-  val
-}
-
-normalize_float32 <- function(value) {
-  if (is.null(value)) return(NA_real_)
-  val <- suppressWarnings(as.numeric(value))
-  val[is.na(val) | is.infinite(val)] <- NA_real_
-  val
-}
-
-normalize_boolean <- function(value) {
-  if (is.null(value)) return(NA)
-  if (is.logical(value)) return(value)
-  if (is.numeric(value)) return(as.logical(value))
-  val_str <- tolower(trimws(as.character(value)))
-  result <- rep(NA, length(val_str))
-  result[val_str %in% c("true",  "1", "yes", "on")]  <- TRUE
-  result[val_str %in% c("false", "0", "no",  "off")] <- FALSE
+infer_malicious_flag <- function(labels) {
+  labels_chr <- tolower(trimws(safe_character(labels)))
+  result <- rep(NA, length(labels_chr))
+  result[grepl("botnet|malware|attack|exploit", labels_chr)] <- TRUE
+  result[grepl("background|normal|benign", labels_chr)] <- FALSE
   as.logical(result)
 }
 
-normalize_threat_score <- function(score) {
-  if (is.null(score) || is.na(score)) {
-    return(NA_real_)
+finalize_network_flows <- function(df) {
+  if (nrow(df) == 0) {
+    return(empty_network_flows())
   }
 
-  val <- suppressWarnings(as.numeric(score))
-  if (is.na(val) || val < 0 || val > 1) {
-    return(NA_real_)
+  missing_cols <- setdiff(UNIFIED_FLOW_COLUMNS, names(df))
+  for (col in missing_cols) {
+    df[[col]] <- empty_network_flows()[[col]]
   }
 
-  return(val)
+  df <- df[, UNIFIED_FLOW_COLUMNS, drop = FALSE]
+
+  df$source_record_index <- safe_integer(df$source_record_index)
+  df$src_port <- safe_port(df$src_port)
+  df$dst_port <- safe_port(df$dst_port)
+  df$duration_sec <- safe_numeric(df$duration_sec)
+  df$packets_total <- safe_uint64(df$packets_total)
+  df$packets_src <- safe_uint64(df$packets_src)
+  df$packets_dst <- safe_uint64(df$packets_dst)
+  df$bytes_total <- safe_uint64(df$bytes_total)
+  df$bytes_src <- safe_uint64(df$bytes_src)
+  df$bytes_dst <- safe_uint64(df$bytes_dst)
+  df$src_ttl <- safe_integer(df$src_ttl)
+  df$dst_ttl <- safe_integer(df$dst_ttl)
+  df$rtt_sec <- safe_numeric(df$rtt_sec)
+  df$synack_sec <- safe_numeric(df$synack_sec)
+  df$ackdat_sec <- safe_numeric(df$ackdat_sec)
+  df$is_malicious <- safe_bool(df$is_malicious)
+
+  df$src_ip <- safe_character(df$src_ip)
+  df$dst_ip <- safe_character(df$dst_ip)
+  df$flow_id <- safe_character(df$flow_id)
+  df$event_id <- safe_character(df$event_id)
+  df$ingest_run_id <- safe_character(df$ingest_run_id)
+  df$source_dataset <- safe_character(df$source_dataset)
+  df$source_key <- safe_character(df$source_key)
+  df$source_file_name <- safe_character(df$source_file_name)
+  df$source_format <- safe_character(df$source_format)
+  df$handler_name <- safe_character(df$handler_name)
+  df$transport_proto <- normalize_transport_proto(df$transport_proto)
+  df$app_proto <- safe_character(df$app_proto)
+  df$flow_state <- safe_character(df$flow_state)
+  df$direction <- safe_character(df$direction)
+  df$source_label <- safe_character(df$source_label)
+  df$attack_category <- safe_character(df$attack_category)
+  df$attributes_json <- safe_character(df$attributes_json)
+
+  empty_ip_version <- !nzchar(df$ip_version)
+  df$ip_version <- safe_character(df$ip_version)
+  df$ip_version[empty_ip_version] <- detect_ip_version(df$src_ip[empty_ip_version], df$dst_ip[empty_ip_version])
+
+  end_missing <- is.na(df$flow_end) & !is.na(df$flow_start) & !is.na(df$duration_sec)
+  df$flow_end[end_missing] <- df$flow_start[end_missing] + df$duration_sec[end_missing]
+
+  df
 }
 
-normalize_severity <- function(severity) {
-  if (is.null(severity) || is.na(severity) || nchar(as.character(severity)) == 0) {
-    return(NA_character_)
-  }
-
-  severity <- toupper(trimws(as.character(severity)))
-  valid_severities <- c("LOW", "MEDIUM", "HIGH", "CRITICAL")
-
-  if (!severity %in% valid_severities) {
-    return(NA_character_)
-  }
-
-  return(severity)
-}
-
-normalize_string <- function(value, max_length = NULL) {
-  # Векторизованная версия: работает и с одиночными значениями, и с векторами
-  if (is.null(value)) return(NA_character_)
-
-  str_val <- as.character(value)
-  str_val <- trimws(str_val)
-  str_val[is.na(value)] <- NA_character_
-
-  if (!is.null(max_length)) {
-    too_long <- !is.na(str_val) & nchar(str_val) > max_length
-    str_val[too_long] <- substr(str_val[too_long], 1, max_length)
-  }
-
-  return(str_val)
-}
-
-normalize_dataset_info <- function(dataset_info) {
-  if (nrow(dataset_info) == 0) {
-    return(dataset_info)
-  }
-
-  dataset_info$pcap_file <- normalize_string(dataset_info$pcap_file)
-  dataset_info$analysis_time <- normalize_timestamp(dataset_info$analysis_time)
-  dataset_info$captipper_version <- normalize_string(dataset_info$captipper_version)
-  dataset_info$traffic_time <- normalize_timestamp(dataset_info$traffic_time)
-
-  return(dataset_info)
-}
-
-normalize_client_attributes <- function(client_attributes) {
-  if (nrow(client_attributes) == 0) {
-    return(client_attributes)
-  }
-
-  client_attributes$attribute_name <- normalize_string(client_attributes$attribute_name)
-  client_attributes$attribute_value <- normalize_string(client_attributes$attribute_value, max_length = 10000)
-
-  return(client_attributes)
-}
-
-normalize_flow_edges <- function(flow_edges) {
-  if (nrow(flow_edges) == 0) {
-    return(flow_edges)
-  }
-
-  flow_edges$parent_name <- normalize_string(flow_edges$parent_name)
-  flow_edges$child_name <- normalize_string(flow_edges$child_name)
-  flow_edges$depth <- normalize_uint32(flow_edges$depth)
-  flow_edges$root_name <- normalize_string(flow_edges$root_name)
-  flow_edges$path <- normalize_string(flow_edges$path, max_length = 1000)
-
-  return(flow_edges)
-}
-
-normalize_conversation_artifacts <- function(artifacts) {
-  if (nrow(artifacts) == 0) {
-    return(artifacts)
-  }
-
-  artifacts$conversation_idx <- normalize_uint32(artifacts$conversation_idx)
-  artifacts$uri_idx <- normalize_uint32(artifacts$uri_idx)
-  artifacts$conversation_name <- normalize_string(artifacts$conversation_name)
-  artifacts$conversation_ip_raw <- normalize_string(artifacts$conversation_ip_raw)
-  artifacts$conversation_host <- normalize_string(artifacts$conversation_host)
-  artifacts$conversation_port <- normalize_port(artifacts$conversation_port)
-  artifacts$artifact_id <- normalize_uint32(artifacts$artifact_id)
-  artifacts$event_time_raw <- normalize_string(artifacts$event_time_raw)
-  artifacts$event_time_parsed <- normalize_timestamp(artifacts$event_time_parsed)
-  artifacts$host <- normalize_string(artifacts$host)
-  artifacts$server_ip_raw <- normalize_string(artifacts$server_ip_raw)
-  artifacts$server_host <- normalize_string(artifacts$server_host)
-  artifacts$server_port <- normalize_port(artifacts$server_port)
-  artifacts$uri <- normalize_string(artifacts$uri, max_length = 10000)
-  artifacts$short_uri <- normalize_string(artifacts$short_uri, max_length = 1000)
-  artifacts$method <- normalize_string(artifacts$method)
-  artifacts$filename <- normalize_string(artifacts$filename, max_length = 1000)
-  artifacts$referer <- normalize_string(artifacts$referer, max_length = 10000)
-  artifacts$request_headers_raw <- normalize_string(artifacts$request_headers_raw, max_length = 50000)
-  artifacts$response_headers_raw <- normalize_string(artifacts$response_headers_raw, max_length = 50000)
-  artifacts$response_status_raw <- normalize_string(artifacts$response_status_raw)
-  artifacts$response_status_code <- normalize_uint16(artifacts$response_status_code)
-  artifacts$response_content_type <- normalize_string(artifacts$response_content_type)
-  artifacts$response_length_raw <- normalize_string(artifacts$response_length_raw)
-  artifacts$response_length_bytes <- normalize_uint64(artifacts$response_length_bytes)
-  artifacts$response_body_raw <- normalize_string(artifacts$response_body_raw, max_length = 100000)
-  artifacts$response_body_base64 <- normalize_string(artifacts$response_body_base64, max_length = 100000)
-  artifacts$response_peek <- normalize_string(artifacts$response_peek, max_length = 1000)
-  artifacts$md5 <- normalize_string(artifacts$md5)
-  artifacts$sha256 <- normalize_string(artifacts$sha256)
-  artifacts$magic_ext <- normalize_string(artifacts$magic_ext)
-  artifacts$magic_name <- normalize_string(artifacts$magic_name)
-  artifacts$is_binary <- normalize_boolean(artifacts$is_binary)
-  artifacts$is_executable <- normalize_boolean(artifacts$is_executable)
-  artifacts$hexpeek <- normalize_string(artifacts$hexpeek, max_length = 50000)
-  artifacts$peinfo_raw <- normalize_string(artifacts$peinfo_raw, max_length = 100000)
-
-  return(artifacts)
-}
-
-normalize_parsed_data <- function(parsed_data) {
-  normalized <- list(
-    dataset_info = normalize_dataset_info(parsed_data$dataset_info),
-    client_attributes = normalize_client_attributes(parsed_data$client_attributes),
-    flow_edges = normalize_flow_edges(parsed_data$flow_edges),
-    conversation_artifacts = normalize_conversation_artifacts(parsed_data$conversation_artifacts)
+get_runtime_config <- function() {
+  list(
+    s3_endpoint = Sys.getenv("S3_ENDPOINT_URL", ""),
+    s3_bucket = Sys.getenv("S3_BUCKET", ""),
+    s3_prefix = Sys.getenv("S3_PREFIX", ""),
+    staging_dir = Sys.getenv("STAGING_DIR", "/tmp/r-etl-staging")
   )
-
-  return(normalized)
-}
-
-validate_normalized_data <- function(normalized_data) {
-  errors <- list()
-
-  if (nrow(normalized_data$dataset_info) == 0) {
-    errors <- c(errors, "dataset_info is empty")
-  }
-
-  if (nrow(normalized_data$client_attributes) == 0) {
-    errors <- c(errors, "client_attributes is empty")
-  }
-
-  if (nrow(normalized_data$conversation_artifacts) == 0) {
-    errors <- c(errors, "conversation_artifacts is empty")
-  }
-
-  if (length(errors) > 0) {
-    warning(sprintf("Validation warnings: %s", paste(errors, collapse = "; ")))
-  }
-
-  return(length(errors) == 0)
 }

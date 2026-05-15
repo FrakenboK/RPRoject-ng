@@ -1,21 +1,37 @@
-FROM rocker/tidyverse:4.3.2
+FROM rocker/r-ver:4.3.2
 
-RUN apt-get update && apt-get install -y \
-    libyaml-dev \
+ENV DEBIAN_FRONTEND=noninteractive
+ENV PATH="/opt/zeek/bin:${PATH}"
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    awscli \
+    ca-certificates \
+    curl \
+    gnupg \
+    libcurl4-openssl-dev \
+    libgit2-dev \
+    libssl-dev \
+    libxml2-dev \
+    make \
+    g++ \
+    pkg-config \
+    unzip \
+    wget \
+    zlib1g-dev \
     && rm -rf /var/lib/apt/lists/*
 
-RUN R -q -e " \
-    options(repos = c( \
-        PPM  = 'https://packagemanager.posit.co/cran/__linux__/jammy/latest', \
-        CRAN = 'https://cloud.r-project.org' \
-    )); \
-    install.packages(c('yaml', 'aws.s3', 'DBI', 'RClickhouse')); \
-    pkgs <- c('jsonlite','yaml','stringr','DBI','aws.s3','RClickhouse'); \
-    for (p in pkgs) { library(p, character.only=TRUE); cat(p, ' OK\n') } \
-"
+RUN curl -fsSL https://download.opensuse.org/repositories/security:zeek/xUbuntu_22.04/Release.key \
+    | gpg --dearmor \
+    > /usr/share/keyrings/security_zeek.gpg \
+    && echo "deb [signed-by=/usr/share/keyrings/security_zeek.gpg] https://download.opensuse.org/repositories/security:/zeek/xUbuntu_22.04/ /" \
+    > /etc/apt/sources.list.d/security:zeek.list \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends zeek \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN R -q -e "options(repos = c(CRAN = 'https://cloud.r-project.org')); install.packages(c('data.table', 'jsonlite', 'DBI', 'RClickhouse'))"
 
 WORKDIR /app
 COPY R /app/R
-COPY config /app/config
 
 CMD ["Rscript", "/app/R/main.R"]

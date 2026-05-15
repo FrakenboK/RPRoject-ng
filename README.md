@@ -1,194 +1,137 @@
 # RPRoject-ng
 
-ETL-пайплайн на R для обработки сетевого трафика (CaptIPPER JSON-дампов) из S3
-и загрузки нормализованных данных в ClickHouse.
+`RPRoject-ng` — проект IDC-системы на языке `R`.
 
-### Архитектура проекта:
-![arch](./doc/arch.png)
+Сейчас в репозитории реализована ETL-часть проекта: загрузка сетевых данных из
+`S3`, нормализация в единый формат и запись в `ClickHouse`.
 
-[Презентация](./doc/Архитектура.pptx)
+## Что уже сделано
 
-Поток данных: S3 (JSON-дамп CaptIPPER) → парсинг (`info`, `client`, `flow_tree`,
-`conversations`) → нормализация типов → запись в ClickHouse.
+- весь текущий проект поднимается из одного корневого `docker-compose.yml`
+- ETL запускается как одноразовый контейнер `etl-init`
+- пайплайн листит все объекты в `S3` по префиксу
+- имена файлов не захардкожены
+- все поддержанные источники скачиваются и обрабатываются автоматически
+- данные из разных форматов приводятся к единой таблице `network_flows`
+- происхождение каждой записи сохраняется в полях provenance
+- статус обработки объектов сохраняется в таблице `etl_objects`
+- подтверждён полный прогон `docker compose up --build etl-init` на данных из
+  `S3`
+
+## Поддержанные форматы
+
+- `pcap`
+- `pcapng`
+- `binetflow`
+- `csv`
+- `zip`
+
+Обработка:
+
+- `pcap` / `pcapng` — через `Zeek`
+- `binetflow` — прямой парсинг
+- `csv` — обработчик `UNSW-NB15` и generic flow-CSV
+- `zip` — обход всех вложенных файлов с запуском подходящих обработчиков
+
+Проверенный набор источников:
+
+- `Kyoto 2006+`
+- `UNSW-NB15`
+- `Stratosphere IPS` (`BinetFlow` и `pcap`)
+
+## Формирование сессий
+
+- `pcap` / `pcapng` ETL передаёт в `Zeek` и читает `conn.log`
+- одна запись `conn.log` становится одной записью в `network_flows`
+- в unified-вид маппятся `uid`, `ts`, `duration`, `id.orig_h`, `id.orig_p`,
+  `id.resp_h`, `id.resp_p`, `proto`, `service`, `conn_state`, `orig_*`,
+  `resp_*`
+- `flow_start` берётся из `ts`, `flow_end` вычисляется как
+  `flow_start + duration_sec`
+- для `Kyoto`, `UNSW-NB15` и `BinetFlow` ETL не восстанавливает сессии из
+  пакетов, а нормализует уже готовые flow/session записи
+
+## Kyoto 2006+
+
+Для `Kyoto 2006+` ETL работает с `zip`-архивами.
+
+Внутри архивов находятся:
+
+- каталоги по году и месяцу
+- дневные файлы `.txt`
+
+Файлы `.txt` содержат tab-separated flow/session записи. Это не `pcap`, а уже
+агрегированные сетевые потоки с адресами, портами, временем, протоколом,
+состоянием, объёмом трафика и label-полями.
+
+## Таблицы ClickHouse
+
+- `network_flows` — единая таблица потоков для всех источников
+- `etl_objects` — журнал обработки объектов из `S3`
+
+## Схема БД
+
+`network_flows`:
+
+- идентификация загрузки: `event_id`, `ingest_run_id`
+- provenance: `source_dataset`, `source_key`, `source_file_name`,
+  `source_format`, `handler_name`, `source_record_index`
+- время: `flow_start`, `flow_end`, `duration_sec`
+- адреса и порты: `src_ip`, `src_port`, `dst_ip`, `dst_port`, `ip_version`
+- протоколы и состояние: `transport_proto`, `app_proto`, `flow_state`,
+  `direction`
+- объём и пакеты: `packets_total`, `packets_src`, `packets_dst`, `bytes_total`,
+  `bytes_src`, `bytes_dst`
+- дополнительные сетевые поля: `src_ttl`, `dst_ttl`, `rtt_sec`, `synack_sec`,
+  `ackdat_sec`
+- разметка: `source_label`, `attack_category`, `is_malicious`
+- dataset-specific payload: `attributes_json`
+
+`etl_objects`:
+
+- объект: `source_key`, `source_dataset`, `source_format`, `handler_name`
+- объём и статус: `object_size`, `status`, `records_loaded`
+- служебные поля: `ingest_run_id`, `processed_at`, `message`
+
+## Provenance
+
+Для каждой записи в `network_flows` сохраняются:
+
+- `source_dataset`
+- `source_key`
+- `source_file_name`
+- `source_format`
+- `handler_name`
+- `source_record_index`
+- `ingest_run_id`
 
 ## Структура репозитория
 
-```
+```text
 RPRoject-ng/
-├─ doc/                          # Архитектура и презентация
-│  ├─ arch.png
-│  └─ Архитектура.pptx
-└─ r-etl/                        # ETL-пайплайн на R
-   ├─ docker-compose.yml         # ClickHouse + ETL-сервис
-   ├─ docker/Dockerfile.etl      # Образ rocker/tidyverse:4.3.2 + R-пакеты
+├─ .env.example
+├─ docker-compose.yml
+├─ doc/
+└─ r-etl/
+   ├─ README.md
+   ├─ docker/
+   │  └─ Dockerfile.etl
    └─ R/
-      ├─ main.R                  # Точка входа: оркестрация пайплайна
-      ├─ s3_io.R                 # Скачивание JSON по HTTP/S3 URL
-      ├─ parsing.R               # Парсинг CaptIPPER JSON
-      ├─ normalization.R         # Нормализация типов и значений
-      ├─ clickhouse_io.R         # DDL и вставка в ClickHouse
-      └─ utils.R                 # Логирование и хелперы
+      ├─ main.R
+      ├─ utils.R
+      ├─ normalization.R
+      ├─ s3_io.R
+      ├─ parsing.R
+      ├─ tcp_sessions.R
+      └─ clickhouse_io.R
 ```
 
-## Быстрый старт
-
-Требуется Docker и Docker Compose.
+## Запуск
 
 ```bash
-cd r-etl
-cp .env.example .env             # заполнить креды S3 / ClickHouse
-docker-compose up -d --build     # поднимаем ClickHouse и собираем ETL
-docker-compose run etl           # запускаем пайплайн
+cp .env.example .env
+docker compose up --build etl-init
 ```
 
-Запуск с явными параметрами S3:
-
-```bash
-docker-compose run etl Rscript /app/R/main.R <s3_bucket_url> <item_name>
-```
-
-Подробности по локальному запуску, тестам и пересборке — в
-[r-etl/README.md](./r-etl/README.md).
-
-## Целевые таблицы ClickHouse
-
-| Таблица                  | Содержимое                                                    |
-|--------------------------|---------------------------------------------------------------|
-| `dataset_info`           | Метаданные дампа (pcap_file, версия, время анализа)           |
-| `client_attributes`      | HTTP-атрибуты клиента (User-Agent, Accept и т.п.)             |
-| `flow_edges`             | Рёбра дерева потоков (parent → child, depth, path)            |
-| `conversation_artifacts` | Артефакты HTTP (URI, заголовки, тело, хеши, magic, peinfo)    |
-| `tcp_sessions`           | TCP-сессии из Zeek `conn.log` (uid, ts, src/dst, байты/пакеты, conn_state, history) |
-
-### DDL
-
-Источник истины — [r-etl/R/clickhouse_io.R](./r-etl/R/clickhouse_io.R), таблицы
-создаются автоматически на старте пайплайна (`CREATE TABLE IF NOT EXISTS`).
-
-```sql
-CREATE TABLE IF NOT EXISTS dataset_info (
-  pcap_file         String,
-  analysis_time     DateTime,
-  captipper_version String,
-  traffic_time      DateTime
-) ENGINE = MergeTree()
-ORDER BY (pcap_file);
-
-CREATE TABLE IF NOT EXISTS client_attributes (
-  attribute_name  String,
-  attribute_value String
-) ENGINE = MergeTree()
-ORDER BY (attribute_name);
-
-CREATE TABLE IF NOT EXISTS flow_edges (
-  parent_name String,
-  child_name  String,
-  depth       UInt32,
-  root_name   String,
-  path        String
-) ENGINE = MergeTree()
-ORDER BY (parent_name, child_name);
-
-CREATE TABLE IF NOT EXISTS conversation_artifacts (
-  conversation_idx        UInt32,
-  uri_idx                 UInt32,
-  conversation_name       String,
-  conversation_ip_raw     String,
-  conversation_host       String,
-  conversation_port       Nullable(UInt16),
-  artifact_id             Nullable(UInt32),
-  event_time_raw          String,
-  event_time_parsed       Nullable(DateTime),
-  host                    String,
-  server_ip_raw           String,
-  server_host             String,
-  server_port             Nullable(UInt16),
-  uri                     String,
-  short_uri               String,
-  method                  String,
-  filename                String,
-  referer                 String,
-  request_headers_raw     String,
-  response_headers_raw    String,
-  response_status_raw     String,
-  response_status_code    Nullable(UInt16),
-  response_content_type   String,
-  response_length_raw     String,
-  response_length_bytes   Nullable(UInt64),
-  response_body_raw       String,
-  response_body_base64    String,
-  response_peek           String,
-  md5                     String,
-  sha256                  String,
-  magic_ext               String,
-  magic_name              String,
-  is_binary               Nullable(UInt8),
-  is_executable           Nullable(UInt8),
-  hexpeek                 String,
-  peinfo_raw              String
-) ENGINE = MergeTree()
-ORDER BY (conversation_idx, uri_idx);
-
-CREATE TABLE IF NOT EXISTS tcp_sessions (
-  uid           String,
-  ts            DateTime,
-  orig_h        String,
-  orig_p        Nullable(UInt16),
-  resp_h        String,
-  resp_p        Nullable(UInt16),
-  proto         LowCardinality(String),
-  service       String,
-  duration_sec  Nullable(Float64),
-  orig_bytes    Nullable(UInt64),
-  resp_bytes    Nullable(UInt64),
-  conn_state    LowCardinality(String),
-  missed_bytes  Nullable(UInt64),
-  history       String,
-  orig_pkts     Nullable(UInt64),
-  orig_ip_bytes Nullable(UInt64),
-  resp_pkts     Nullable(UInt64),
-  resp_ip_bytes Nullable(UInt64),
-  local_orig    Nullable(UInt8),
-  local_resp    Nullable(UInt8)
-) ENGINE = MergeTree()
-ORDER BY (ts, uid);
-```
-
-## Сбор TCP-сессий (Zeek conn.log)
-
-Источник — `conn.log`, сгенерированный Zeek в JSON-режиме (NDJSON, по объекту
-на строку), залитый в тот же бакет S3, что и CaptIPPER-дамп. Шаг опциональный:
-включается переменной `S3_CONN_LOG_PREFIX` (имя/префикс объекта в бакете).
-
-```bash
-# на хосте с трафиком
-zeek -r capture.pcap LogAscii::use_json=T
-aws s3 cp conn.log s3://<bucket>/conn.log
-```
-
-```bash
-# в .env
-S3_CONN_LOG_PREFIX=conn.log
-```
-
-При запуске пайплайн скачивает NDJSON, фильтрует только `proto == "TCP"`,
-нормализует поля и пишет в таблицу `tcp_sessions`. Если переменная не задана —
-шаг полностью пропускается, остальная часть пайплайна работает как раньше.
-
-Код: [r-etl/R/tcp_sessions.R](./r-etl/R/tcp_sessions.R), загрузка NDJSON —
-`get_s3_ndjson()` в [r-etl/R/s3_io.R](./r-etl/R/s3_io.R).
-
-## Конфигурация (env)
-
-Поддерживаются как новые `AWS_*`, так и легаси `S3_*` имена переменных
-(см. [r-etl/R/s3_io.R](./r-etl/R/s3_io.R)).
-
-- **S3:** `S3_ENDPOINT_URL`, `S3_BUCKET`, `S3_PREFIX`, `S3_CONN_LOG_PREFIX`
-  (опц., включает сбор TCP-сессий), `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`,
-  `AWS_DEFAULT_REGION`
-- **ClickHouse:** `CLICKHOUSE_HOST`, `CLICKHOUSE_PORT`, `CLICKHOUSE_USER`,
-  `CLICKHOUSE_PASSWORD`, `CLICKHOUSE_DATABASE`
-- **Прочее:** `LOG_LEVEL` (по умолчанию `INFO`), `TZ` (по умолчанию `UTC`)
-
-Если `S3_PREFIX` не задан, имя файла берётся из последнего сегмента
-`S3_ENDPOINT_URL`, иначе используется `dump.json`.
+После завершения контейнера `etl-init` нормализованные данные лежат в
+`ClickHouse`, а журнал обработки объектов — в `etl_objects`.

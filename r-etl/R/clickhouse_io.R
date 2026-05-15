@@ -1,300 +1,140 @@
+library(DBI)
 library(RClickhouse)
 
 get_clickhouse_connection <- function() {
-  host <- Sys.getenv("CLICKHOUSE_HOST", "localhost")
-  port <- as.integer(Sys.getenv("CLICKHOUSE_PORT", "8123"))
-  user <- Sys.getenv("CLICKHOUSE_USER", "default")
-  password <- Sys.getenv("CLICKHOUSE_PASSWORD", "")
-  database <- Sys.getenv("CLICKHOUSE_DATABASE", "default")
-
-  tryCatch({
-    conn <- DBI::dbConnect(
-      RClickhouse::clickhouse(),
-      host = host,
-      port = port,
-      user = user,
-      password = password,
-      db = database
-    )
-    return(conn)
-  }, error = function(e) {
-    stop(sprintf("Failed to connect to ClickHouse: %s", e$message))
-  })
+  DBI::dbConnect(
+    RClickhouse::clickhouse(),
+    host = Sys.getenv("CLICKHOUSE_HOST", "localhost"),
+    port = as.integer(Sys.getenv("CLICKHOUSE_PORT", "9000")),
+    user = Sys.getenv("CLICKHOUSE_USER", "default"),
+    password = Sys.getenv("CLICKHOUSE_PASSWORD", ""),
+    db = Sys.getenv("CLICKHOUSE_DATABASE", "default")
+  )
 }
 
-create_dataset_info_table <- function(conn) {
-  query <- "
-    CREATE TABLE IF NOT EXISTS dataset_info (
-      pcap_file String,
-      analysis_time DateTime,
-      captipper_version String,
-      traffic_time DateTime
+create_network_flows_table <- function(conn) {
+  DBI::dbExecute(conn, "
+    CREATE TABLE IF NOT EXISTS network_flows (
+      event_id            String,
+      ingest_run_id       String,
+      source_dataset      LowCardinality(String),
+      source_key          String,
+      source_file_name    String,
+      source_format       LowCardinality(String),
+      handler_name        LowCardinality(String),
+      source_record_index UInt64,
+      flow_id             String,
+      flow_start          Nullable(DateTime),
+      flow_end            Nullable(DateTime),
+      duration_sec        Nullable(Float64),
+      src_ip              String,
+      src_port            Nullable(UInt16),
+      dst_ip              String,
+      dst_port            Nullable(UInt16),
+      ip_version          LowCardinality(String),
+      transport_proto     LowCardinality(String),
+      app_proto           LowCardinality(String),
+      flow_state          LowCardinality(String),
+      direction           String,
+      packets_total       Nullable(UInt64),
+      packets_src         Nullable(UInt64),
+      packets_dst         Nullable(UInt64),
+      bytes_total         Nullable(UInt64),
+      bytes_src           Nullable(UInt64),
+      bytes_dst           Nullable(UInt64),
+      src_ttl             Nullable(UInt16),
+      dst_ttl             Nullable(UInt16),
+      rtt_sec             Nullable(Float64),
+      synack_sec          Nullable(Float64),
+      ackdat_sec          Nullable(Float64),
+      source_label        String,
+      attack_category     String,
+      is_malicious        Nullable(UInt8),
+      attributes_json     String
     ) ENGINE = MergeTree()
-    ORDER BY (pcap_file)
-  "
-
-  tryCatch({
-    DBI::dbExecute(conn, query)
-    info("Table dataset_info created or already exists")
-  }, error = function(e) {
-    stop(sprintf("Failed to create dataset_info table: %s", e$message))
-  })
+    ORDER BY (source_dataset, source_key, source_record_index)
+  ")
 }
 
-create_client_attributes_table <- function(conn) {
-  query <- "
-    CREATE TABLE IF NOT EXISTS client_attributes (
-      attribute_name String,
-      attribute_value String
+create_etl_objects_table <- function(conn) {
+  DBI::dbExecute(conn, "
+    CREATE TABLE IF NOT EXISTS etl_objects (
+      ingest_run_id    String,
+      source_key       String,
+      source_dataset   LowCardinality(String),
+      source_format    LowCardinality(String),
+      handler_name     LowCardinality(String),
+      object_size      Nullable(UInt64),
+      status           LowCardinality(String),
+      records_loaded   Nullable(UInt64),
+      processed_at     DateTime,
+      message          String
     ) ENGINE = MergeTree()
-    ORDER BY (attribute_name)
-  "
-
-  tryCatch({
-    DBI::dbExecute(conn, query)
-    info("Table client_attributes created or already exists")
-  }, error = function(e) {
-    stop(sprintf("Failed to create client_attributes table: %s", e$message))
-  })
-}
-
-create_flow_edges_table <- function(conn) {
-  query <- "
-    CREATE TABLE IF NOT EXISTS flow_edges (
-      parent_name String,
-      child_name String,
-      depth UInt32,
-      root_name String,
-      path String
-    ) ENGINE = MergeTree()
-    ORDER BY (parent_name, child_name)
-  "
-
-  tryCatch({
-    DBI::dbExecute(conn, query)
-    info("Table flow_edges created or already exists")
-  }, error = function(e) {
-    stop(sprintf("Failed to create flow_edges table: %s", e$message))
-  })
-}
-
-create_conversation_artifacts_table <- function(conn) {
-  query <- "
-    CREATE TABLE IF NOT EXISTS conversation_artifacts (
-      conversation_idx UInt32,
-      uri_idx UInt32,
-      conversation_name String,
-      conversation_ip_raw String,
-      conversation_host String,
-      conversation_port Nullable(UInt16),
-      artifact_id Nullable(UInt32),
-      event_time_raw String,
-      event_time_parsed Nullable(DateTime),
-      host String,
-      server_ip_raw String,
-      server_host String,
-      server_port Nullable(UInt16),
-      uri String,
-      short_uri String,
-      method String,
-      filename String,
-      referer String,
-      request_headers_raw String,
-      response_headers_raw String,
-      response_status_raw String,
-      response_status_code Nullable(UInt16),
-      response_content_type String,
-      response_length_raw String,
-      response_length_bytes Nullable(UInt64),
-      response_body_raw String,
-      response_body_base64 String,
-      response_peek String,
-      md5 String,
-      sha256 String,
-      magic_ext String,
-      magic_name String,
-      is_binary Nullable(UInt8),
-      is_executable Nullable(UInt8),
-      hexpeek String,
-      peinfo_raw String
-    ) ENGINE = MergeTree()
-    ORDER BY (conversation_idx, uri_idx)
-  "
-
-  tryCatch({
-    DBI::dbExecute(conn, query)
-    info("Table conversation_artifacts created or already exists")
-  }, error = function(e) {
-    stop(sprintf("Failed to create conversation_artifacts table: %s", e$message))
-  })
-}
-
-create_tcp_sessions_table <- function(conn) {
-  query <- "
-    CREATE TABLE IF NOT EXISTS tcp_sessions (
-      uid           String,
-      ts            DateTime,
-      orig_h        String,
-      orig_p        Nullable(UInt16),
-      resp_h        String,
-      resp_p        Nullable(UInt16),
-      proto         LowCardinality(String),
-      service       String,
-      duration_sec  Nullable(Float64),
-      orig_bytes    Nullable(UInt64),
-      resp_bytes    Nullable(UInt64),
-      conn_state    LowCardinality(String),
-      missed_bytes  Nullable(UInt64),
-      history       String,
-      orig_pkts     Nullable(UInt64),
-      orig_ip_bytes Nullable(UInt64),
-      resp_pkts     Nullable(UInt64),
-      resp_ip_bytes Nullable(UInt64),
-      local_orig    Nullable(UInt8),
-      local_resp    Nullable(UInt8)
-    ) ENGINE = MergeTree()
-    ORDER BY (ts, uid)
-  "
-
-  tryCatch({
-    DBI::dbExecute(conn, query)
-    info("Table tcp_sessions created or already exists")
-  }, error = function(e) {
-    stop(sprintf("Failed to create tcp_sessions table: %s", e$message))
-  })
+    ORDER BY (processed_at, source_key)
+  ")
 }
 
 create_all_tables <- function(conn) {
-  create_dataset_info_table(conn)
-  create_client_attributes_table(conn)
-  create_flow_edges_table(conn)
-  create_conversation_artifacts_table(conn)
-  create_tcp_sessions_table(conn)
+  create_network_flows_table(conn)
+  create_etl_objects_table(conn)
 }
 
-insert_dataset_info <- function(conn, dataset_info) {
-  if (nrow(dataset_info) == 0) {
-    warning("No dataset_info to insert")
-    return(invisible(NULL))
+prepare_network_flows_for_insert <- function(df) {
+  if (nrow(df) == 0) {
+    return(df)
   }
 
-  tryCatch({
-    DBI::dbWriteTable(conn, "dataset_info", dataset_info, append = TRUE, row.names = FALSE)
-    info(sprintf("Inserted %d row(s) into dataset_info", nrow(dataset_info)))
-  }, error = function(e) {
-    stop(sprintf("Failed to insert dataset_info: %s", e$message))
-  })
-}
+  string_cols <- c(
+    "event_id", "ingest_run_id", "source_dataset", "source_key", "source_file_name",
+    "source_format", "handler_name", "flow_id", "src_ip", "dst_ip", "ip_version",
+    "transport_proto", "app_proto", "flow_state", "direction", "source_label",
+    "attack_category", "attributes_json"
+  )
 
-insert_client_attributes <- function(conn, client_attributes) {
-  if (nrow(client_attributes) == 0) {
-    warning("No client_attributes to insert")
-    return(invisible(NULL))
-  }
-
-  tryCatch({
-    DBI::dbWriteTable(conn, "client_attributes", client_attributes, append = TRUE, row.names = FALSE)
-    info(sprintf("Inserted %d row(s) into client_attributes", nrow(client_attributes)))
-  }, error = function(e) {
-    stop(sprintf("Failed to insert client_attributes: %s", e$message))
-  })
-}
-
-insert_flow_edges <- function(conn, flow_edges) {
-  if (nrow(flow_edges) == 0) {
-    warning("No flow_edges to insert")
-    return(invisible(NULL))
-  }
-
-  tryCatch({
-    DBI::dbWriteTable(conn, "flow_edges", flow_edges, append = TRUE, row.names = FALSE)
-    info(sprintf("Inserted %d row(s) into flow_edges", nrow(flow_edges)))
-  }, error = function(e) {
-    stop(sprintf("Failed to insert flow_edges: %s", e$message))
-  })
-}
-
-insert_conversation_artifacts <- function(conn, artifacts) {
-  if (nrow(artifacts) == 0) {
-    warning("No conversation_artifacts to insert")
-    return(invisible(NULL))
-  }
-
-  # RClickhouse не поддерживает R logical -> Nullable(UInt8) автоматически
-  artifacts$is_binary    <- as.integer(artifacts$is_binary)
-  artifacts$is_executable <- as.integer(artifacts$is_executable)
-
-  # Заменяем NULL/NA в String-колонках на пустую строку (так семантически вернее для String в CH)
-  string_cols <- c('conversation_name','conversation_ip_raw','conversation_host',
-    'event_time_raw','host','server_ip_raw','server_host','uri','short_uri',
-    'method','filename','referer','request_headers_raw','response_headers_raw',
-    'response_status_raw','response_content_type','response_length_raw',
-    'response_body_raw','response_body_base64','response_peek',
-    'md5','sha256','magic_ext','magic_name','hexpeek','peinfo_raw')
   for (col in string_cols) {
-    if (col %in% names(artifacts)) {
-      artifacts[[col]][is.na(artifacts[[col]])] <- ""
-    }
+    df[[col]][is.na(df[[col]])] <- ""
   }
 
-  tryCatch({
-    DBI::dbWriteTable(conn, "conversation_artifacts", artifacts, append = TRUE, row.names = FALSE)
-    info(sprintf("Inserted %d row(s) into conversation_artifacts", nrow(artifacts)))
-  }, error = function(e) {
-    stop(sprintf("Failed to insert conversation_artifacts: %s", e$message))
-  })
+  df$is_malicious <- as.integer(df$is_malicious)
+  df
 }
 
-insert_tcp_sessions <- function(conn, tcp_sessions) {
-  if (nrow(tcp_sessions) == 0) {
-    warning_log("No tcp_sessions to insert")
+insert_network_flows <- function(conn, flows) {
+  if (nrow(flows) == 0) {
     return(invisible(NULL))
   }
 
-  string_cols <- c("uid", "orig_h", "resp_h", "proto", "service", "conn_state", "history")
-  for (col in string_cols) {
-    if (col %in% names(tcp_sessions)) {
-      tcp_sessions[[col]][is.na(tcp_sessions[[col]])] <- ""
-    }
-  }
-
-  tryCatch({
-    DBI::dbWriteTable(conn, "tcp_sessions", tcp_sessions, append = TRUE, row.names = FALSE)
-    info(sprintf("Inserted %d row(s) into tcp_sessions", nrow(tcp_sessions)))
-  }, error = function(e) {
-    stop(sprintf("Failed to insert tcp_sessions: %s", e$message))
-  })
+  flows <- prepare_network_flows_for_insert(flows)
+  DBI::dbWriteTable(conn, "network_flows", flows, append = TRUE, row.names = FALSE)
+  info(sprintf("Inserted %d row(s) into network_flows", nrow(flows)))
 }
 
-insert_normalized_data <- function(conn, normalized_data) {
-  insert_dataset_info(conn, normalized_data$dataset_info)
-  insert_client_attributes(conn, normalized_data$client_attributes)
-  insert_flow_edges(conn, normalized_data$flow_edges)
-  insert_conversation_artifacts(conn, normalized_data$conversation_artifacts)
-  if (!is.null(normalized_data$tcp_sessions)) {
-    insert_tcp_sessions(conn, normalized_data$tcp_sessions)
-  }
+build_object_status_row <- function(ingest_run_id, source_object, handler_name, status, records_loaded, message) {
+  data.frame(
+    ingest_run_id = ingest_run_id,
+    source_key = source_object$key,
+    source_dataset = source_object$dataset_name,
+    source_format = source_object$extension,
+    handler_name = handler_name,
+    object_size = source_object$size,
+    status = status,
+    records_loaded = records_loaded,
+    processed_at = Sys.time(),
+    message = message,
+    stringsAsFactors = FALSE
+  )
+}
+
+insert_etl_object_status <- function(conn, status_row) {
+  DBI::dbWriteTable(conn, "etl_objects", status_row, append = TRUE, row.names = FALSE)
 }
 
 test_connection <- function(conn) {
-  tryCatch({
-    result <- DBI::dbGetQuery(conn, "SELECT 1 as test")
-    if (nrow(result) > 0 && result$test[1] == 1) {
-      info("ClickHouse connection test successful")
-      return(TRUE)
-    }
-    return(FALSE)
-  }, error = function(e) {
-    error_log(sprintf("ClickHouse connection test failed: %s", e$message))
-    return(FALSE)
-  })
+  result <- DBI::dbGetQuery(conn, "SELECT 1 AS ok")
+  nrow(result) == 1 && !is.na(suppressWarnings(as.numeric(result$ok[[1]]))) &&
+    suppressWarnings(as.numeric(result$ok[[1]])) == 1
 }
 
 close_connection <- function(conn) {
-  tryCatch({
-    DBI::dbDisconnect(conn)
-    info("ClickHouse connection closed")
-  }, error = function(e) {
-    warning_log(sprintf("Failed to close ClickHouse connection: %s", e$message))
-  })
+  tryCatch(DBI::dbDisconnect(conn), error = function(e) invisible(NULL))
 }
