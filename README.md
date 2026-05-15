@@ -2,18 +2,20 @@
 
 `RPRoject-ng` — IDC-система на `R`.
 
-Сейчас в репозитории реализованы две части:
+Сейчас в репозитории реализованы три части:
 
 - ETL-модуль
 - модуль анализа данных
+- веб-интерфейс на `R Shiny`
 
-Обе части запускаются из одного корневого `docker-compose.yml`.
+Все части запускаются из одного корневого `docker-compose.yml`.
 
 ## Состав проекта
 
 - `clickhouse` — хранилище нормализованных потоков и сработок
 - `etl-init` — одноразовый ETL-контейнер
 - `analysis` — одноразовый контейнер анализа данных
+- `ui` — Shiny-интерфейс с обзором, фильтрами по сработкам, drill-down и запуском ETL/analysis
 
 ## Запуск
 
@@ -21,8 +23,10 @@
 cp .env.example .env
 docker compose up --build etl-init
 docker compose up --build analysis
+docker compose up --build ui
 ```
 
+UI доступен на `http://localhost:3838` (порт настраивается переменной `UI_PORT`).
 `ClickHouse` наружу не публикуется и доступен только внутри docker-сети.
 
 ## Что уже сделано
@@ -111,6 +115,13 @@ docker compose up --build analysis
 - `analysis_detections` — summary-сработки
 - `analysis_detection_events` — связь сработки с исходными flow-событиями
 
+## UI
+
+- `Shiny`-приложение поверх `ClickHouse`
+- четыре вкладки: Обзор, Сработки, Детализация, Действия
+- запуск ETL/analysis из UI через `docker compose run` (требует монтирования `docker.sock`)
+- подробности в [r-ui/README.md](r-ui/README.md)
+
 ## Схема БД
 
 `network_flows`:
@@ -164,9 +175,13 @@ RPRoject-ng/
 │  ├─ README.md
 │  ├─ docker/
 │  └─ R/
-└─ r-analysis/
+├─ r-analysis/
+│  ├─ README.md
+│  ├─ docker/
+│  ├─ rules/
+│  └─ R/
+└─ r-ui/
    ├─ README.md
    ├─ docker/
-   ├─ rules/
    └─ R/
 ```
