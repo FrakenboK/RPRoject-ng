@@ -19,7 +19,6 @@ services:
     build:
       context: ./r-etl
       dockerfile: docker/Dockerfile.etl
-    platform: linux/amd64
     depends_on:
       clickhouse:
         condition: service_healthy
@@ -36,7 +35,6 @@ services:
     build:
       context: ./r-analysis
       dockerfile: docker/Dockerfile.analysis
-    platform: linux/amd64
     depends_on:
       clickhouse:
         condition: service_healthy
@@ -49,6 +47,29 @@ services:
       ANALYSIS_WINDOW_MINUTES: ${ANALYSIS_WINDOW_MINUTES:-5}
       TZ: ${TZ:-UTC}
     restart: "no"
+
+  ui:
+    build:
+      context: ./r-ui
+      dockerfile: docker/Dockerfile.ui
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+    env_file:
+      - .env
+    environment:
+      CLICKHOUSE_HOST: clickhouse
+      CLICKHOUSE_PORT: 9000
+      COMPOSE_PROJECT_DIR: /compose
+      COMPOSE_PROJECT_NAME: ${COMPOSE_PROJECT_NAME:-rproject-ng}
+      TZ: ${TZ:-UTC}
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - .:/compose:ro
+      - ./r-ui/R:/app/R:ro
+    ports:
+      - "${UI_PORT:-3838}:3838"
+    restart: unless-stopped
 
 volumes:
   clickhouse_data:
