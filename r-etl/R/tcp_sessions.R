@@ -1,103 +1,106 @@
 library(jsonlite)
 
-# Парсинг Zeek conn.log в формате line-delimited JSON.
-# Поддерживается также передача уже разобранного списка записей.
-parse_zeek_conn_log <- function(records) {
-  if (length(records) == 0) {
-    return(empty_tcp_sessions_df())
+resolve_zeek_binary <- function() {
+  zeek_bin <- Sys.which("zeek")
+  if (nzchar(zeek_bin)) {
+    return(zeek_bin)
   }
 
-  rows <- lapply(records, function(r) {
+  fallback <- "/opt/zeek/bin/zeek"
+  if (file.exists(fallback)) {
+    return(fallback)
+  }
+
+  stop("Zeek binary was not found in PATH or /opt/zeek/bin/zeek")
+}
+
+parse_pcap_with_zeek <- function(path, source_object, ingest_run_id, staging_dir) {
+  info(sprintf("Running Zeek for %s", source_object$key))
+
+  output_dir <- file.path(
+    staging_dir,
+    ".zeek",
+    gsub("[^A-Za-z0-9._-]", "_", source_object$key)
+  )
+  ensure_dir(output_dir)
+
+  old_wd <- getwd()
+  on.exit(setwd(old_wd), add = TRUE)
+  setwd(output_dir)
+
+  run_command(
+    command = resolve_zeek_binary(),
+    args = c(
+      "-C",
+      "-r", normalizePath(path, winslash = "/", mustWork = TRUE),
+      "LogAscii::use_json=T"
+    )
+  )
+
+  conn_log_path <- file.path(output_dir, "conn.log")
+  if (!file.exists(conn_log_path)) {
+    stop(sprintf("Zeek did not produce conn.log for %s", source_object$key))
+  }
+
+  parse_zeek_conn_log_file(conn_log_path, source_object, ingest_run_id)
+}
+
+parse_zeek_conn_log_file <- function(log_path, source_object, ingest_run_id) {
+  lines <- readLines(log_path, warn = FALSE, encoding = "UTF-8")
+  lines <- lines[nzchar(trimws(lines)) & !startsWith(trimws(lines), "#")]
+
+  if (length(lines) == 0) {
+    return(empty_network_flows())
+  }
+
+  records <- lapply(lines, function(line) {
+    jsonlite::fromJSON(line, simplifyVector = FALSE)
+  })
+
+  rows <- lapply(records, function(record) {
     list(
-      uid           = r[["uid"]]              %||% NA_character_,
-      ts_raw        = r[["ts"]]               %||% NA_real_,
-      proto         = r[["proto"]]            %||% NA_character_,
-      service       = r[["service"]]          %||% NA_character_,
-      orig_h        = r[["id.orig_h"]]        %||% r$id$orig_h %||% NA_character_,
-      orig_p        = r[["id.orig_p"]]        %||% r$id$orig_p %||% NA_integer_,
-      resp_h        = r[["id.resp_h"]]        %||% r$id$resp_h %||% NA_character_,
-      resp_p        = r[["id.resp_p"]]        %||% r$id$resp_p %||% NA_integer_,
-      duration      = r[["duration"]]         %||% NA_real_,
-      orig_bytes    = r[["orig_bytes"]]       %||% NA_real_,
-      resp_bytes    = r[["resp_bytes"]]       %||% NA_real_,
-      conn_state    = r[["conn_state"]]       %||% NA_character_,
-      missed_bytes  = r[["missed_bytes"]]     %||% NA_real_,
-      history       = r[["history"]]          %||% NA_character_,
-      orig_pkts     = r[["orig_pkts"]]        %||% NA_real_,
-      orig_ip_bytes = r[["orig_ip_bytes"]]    %||% NA_real_,
-      resp_pkts     = r[["resp_pkts"]]        %||% NA_real_,
-      resp_ip_bytes = r[["resp_ip_bytes"]]    %||% NA_real_,
-      local_orig    = r[["local_orig"]]       %||% NA,
-      local_resp    = r[["local_resp"]]       %||% NA
+      uid = record[["uid"]] %||% "",
+      ts = record[["ts"]] %||% NA_real_,
+      orig_h = record[["id.orig_h"]] %||% "",
+      orig_p = record[["id.orig_p"]] %||% NA_integer_,
+      resp_h = record[["id.resp_h"]] %||% "",
+      resp_p = record[["id.resp_p"]] %||% NA_integer_,
+      proto = record[["proto"]] %||% "",
+      service = record[["service"]] %||% "",
+      duration = record[["duration"]] %||% NA_real_,
+      orig_bytes = record[["orig_bytes"]] %||% NA_real_,
+      resp_bytes = record[["resp_bytes"]] %||% NA_real_,
+      conn_state = record[["conn_state"]] %||% "",
+      history = record[["history"]] %||% "",
+      orig_pkts = record[["orig_pkts"]] %||% NA_real_,
+      resp_pkts = record[["resp_pkts"]] %||% NA_real_,
+      orig_ip_bytes = record[["orig_ip_bytes"]] %||% NA_real_,
+      resp_ip_bytes = record[["resp_ip_bytes"]] %||% NA_real_,
+      local_orig = record[["local_orig"]] %||% NA,
+      local_resp = record[["local_resp"]] %||% NA
     )
   })
 
-  do.call(rbind.data.frame, c(rows, list(stringsAsFactors = FALSE)))
+  dt <- rbindlist(rows, fill = TRUE)
+  frame <- base_unified_frame(nrow(dt), source_object, ingest_run_id, "pcap_zeek_connlog", "pcap")
+  frame$flow_id <- safe_character(dt$uid)
+  frame$flow_start <- as.POSIXct(safe_numeric(dt$ts), origin = "1970-01-01", tz = "UTC")
+  frame$duration_sec <- safe_numeric(dt$duration)
+  frame$flow_end <- frame$flow_start + frame$duration_sec
+  frame$src_ip <- safe_character(dt$orig_h)
+  frame$src_port <- safe_port(dt$orig_p)
+  frame$dst_ip <- safe_character(dt$resp_h)
+  frame$dst_port <- safe_port(dt$resp_p)
+  frame$transport_proto <- safe_character(dt$proto)
+  frame$app_proto <- safe_character(dt$service)
+  frame$flow_state <- safe_character(dt$conn_state)
+  frame$packets_src <- safe_uint64(dt$orig_pkts)
+  frame$packets_dst <- safe_uint64(dt$resp_pkts)
+  frame$packets_total <- safe_uint64(safe_numeric(dt$orig_pkts) + safe_numeric(dt$resp_pkts))
+  frame$bytes_src <- safe_uint64(dt$orig_bytes)
+  frame$bytes_dst <- safe_uint64(dt$resp_bytes)
+  frame$bytes_total <- safe_uint64(safe_numeric(dt$orig_bytes) + safe_numeric(dt$resp_bytes))
+  frame$attributes_json <- rep("{}", nrow(frame))
+
+  finalize_network_flows(frame)
 }
-
-# Только TCP-сессии, остальное отбрасывается на уровне нормализации.
-normalize_tcp_sessions <- function(df) {
-  if (nrow(df) == 0) {
-    return(empty_tcp_sessions_df())
-  }
-
-  df <- df[!is.na(df$proto) & toupper(df$proto) == "TCP", , drop = FALSE]
-  if (nrow(df) == 0) {
-    return(empty_tcp_sessions_df())
-  }
-
-  ts_numeric <- suppressWarnings(as.numeric(df$ts_raw))
-  ts_parsed  <- as.POSIXct(ts_numeric, origin = "1970-01-01", tz = "UTC")
-
-  data.frame(
-    uid              = as.character(df$uid),
-    ts               = ts_parsed,
-    orig_h           = vapply(df$orig_h, normalize_ipv4,   character(1), USE.NAMES = FALSE),
-    orig_p           = normalize_port(df$orig_p),
-    resp_h           = vapply(df$resp_h, normalize_ipv4,   character(1), USE.NAMES = FALSE),
-    resp_p           = normalize_port(df$resp_p),
-    proto            = "TCP",
-    service          = ifelse(is.na(df$service), "", as.character(df$service)),
-    duration_sec     = vapply(df$duration,      to_float32, numeric(1), USE.NAMES = FALSE),
-    orig_bytes       = vapply(df$orig_bytes,    to_uint64,  numeric(1), USE.NAMES = FALSE),
-    resp_bytes       = vapply(df$resp_bytes,    to_uint64,  numeric(1), USE.NAMES = FALSE),
-    conn_state       = ifelse(is.na(df$conn_state), "", as.character(df$conn_state)),
-    missed_bytes     = vapply(df$missed_bytes,  to_uint64,  numeric(1), USE.NAMES = FALSE),
-    history          = ifelse(is.na(df$history), "", as.character(df$history)),
-    orig_pkts        = vapply(df$orig_pkts,     to_uint64,  numeric(1), USE.NAMES = FALSE),
-    orig_ip_bytes    = vapply(df$orig_ip_bytes, to_uint64,  numeric(1), USE.NAMES = FALSE),
-    resp_pkts        = vapply(df$resp_pkts,     to_uint64,  numeric(1), USE.NAMES = FALSE),
-    resp_ip_bytes    = vapply(df$resp_ip_bytes, to_uint64,  numeric(1), USE.NAMES = FALSE),
-    local_orig       = as.integer(as.logical(df$local_orig)),
-    local_resp       = as.integer(as.logical(df$local_resp)),
-    stringsAsFactors = FALSE
-  )
-}
-
-empty_tcp_sessions_df <- function() {
-  data.frame(
-    uid           = character(0),
-    ts            = as.POSIXct(character(0), tz = "UTC"),
-    orig_h        = character(0),
-    orig_p        = integer(0),
-    resp_h        = character(0),
-    resp_p        = integer(0),
-    proto         = character(0),
-    service       = character(0),
-    duration_sec  = numeric(0),
-    orig_bytes    = numeric(0),
-    resp_bytes    = numeric(0),
-    conn_state    = character(0),
-    missed_bytes  = numeric(0),
-    history       = character(0),
-    orig_pkts     = numeric(0),
-    orig_ip_bytes = numeric(0),
-    resp_pkts     = numeric(0),
-    resp_ip_bytes = numeric(0),
-    local_orig    = integer(0),
-    local_resp    = integer(0),
-    stringsAsFactors = FALSE
-  )
-}
-
-`%||%` <- function(a, b) if (is.null(a) || (length(a) == 1 && is.na(a))) b else a

@@ -1,0 +1,36 @@
+services:
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.8
+    environment:
+      CLICKHOUSE_DB: ${CLICKHOUSE_DATABASE}
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD}
+      TZ: ${TZ:-UTC}
+    volumes:
+      - clickhouse_data:/var/lib/clickhouse
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8123/ping | grep -q 'Ok.'"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 15s
+
+  etl-init:
+    build:
+      context: ./r-etl
+      dockerfile: docker/Dockerfile.etl
+    platform: linux/amd64
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+    env_file:
+      - .env
+    environment:
+      CLICKHOUSE_HOST: clickhouse
+      CLICKHOUSE_PORT: 9000
+      STAGING_DIR: /tmp/r-etl-staging
+      TZ: ${TZ:-UTC}
+    restart: "no"
+
+volumes:
+  clickhouse_data:
