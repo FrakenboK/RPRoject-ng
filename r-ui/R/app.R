@@ -110,8 +110,21 @@ ui <- page_navbar(
     ),
 
     card(
-      card_header("Потоки по дням"),
-      plotOutput("plot_flows_day", height = "300px")
+      card_header("Потоки по периоду"),
+      layout_columns(
+        col_widths = c(3, 5, 4),
+        selectInput("flows_granularity", "Гранулярность",
+                    choices = c("День" = "day", "Неделя" = "week", "Месяц" = "month"),
+                    selected = "day"),
+        dateRangeInput("flows_date_range", "Диапазон дат",
+                       start = NULL, end = NULL,
+                       startview = "year", weekstart = 1, separator = " — "),
+        actionButton("flows_reset", "Авто-диапазон",
+                     icon = icon("magnifying-glass-arrow-right"),
+                     class = "btn-secondary")
+      ),
+      plotOutput("plot_flows_day", height = "320px"),
+      tags$small(textOutput("flows_range_info"), style = "color: #7f8c8d;")
     ),
 
     layout_columns(
@@ -320,38 +333,95 @@ server <- function(input, output, session) {
       title("Нет данных")
       return()
     }
+    df$detections <- as.numeric(df$detections)
     df <- df[order(df$detections, decreasing = TRUE), , drop = FALSE]
     colors <- ifelse(df$severity %in% c("critical", "high"), "#e74c3c",
               ifelse(df$severity == "medium", "#f39c12",
               ifelse(df$severity == "low", "#3498db", "#95a5a6")))
-    barplot(
-      df$detections,
+
+    par(mar = c(4, 5, 2, 1))
+    counts_sqrt <- sqrt(df$detections)
+    ymax <- max(counts_sqrt) * 1.18
+    bp <- barplot(
+      counts_sqrt,
       names.arg = df$severity,
       col = colors,
       border = NA,
       las = 1,
       main = "",
-      ylab = "Число сработок"
+      ylab = "Число сработок (√-шкала)",
+      ylim = c(0, ymax),
+      yaxt = "n"
     )
+    nice_ticks <- pretty(c(0, max(df$detections)), n = 6)
+    axis(2, at = sqrt(nice_ticks), labels = format(nice_ticks, big.mark = " "), las = 1)
+    text(bp, counts_sqrt, labels = format(df$detections, big.mark = " "),
+         pos = 3, cex = 0.95, font = 2)
+  })
+
+  flow_time_range <- reactive({
+    auto_tick()
+    fetch_flow_time_range()
+  })
+
+  observe({
+    rng <- flow_time_range()
+    if (is.null(rng) || nrow(rng) == 0) return()
+    min_ts <- as.Date(as.POSIXct(rng$min_ts[[1]], tz = "UTC"))
+    max_ts <- as.Date(as.POSIXct(rng$max_ts[[1]], tz = "UTC"))
+    if (!is.na(min_ts) && !is.na(max_ts) &&
+        (is.null(input$flows_date_range) || is.na(input$flows_date_range[[1]]))) {
+      updateDateRangeInput(session, "flows_date_range", start = min_ts, end = max_ts)
+    }
+  })
+
+  observeEvent(input$flows_reset, {
+    rng <- flow_time_range()
+    if (is.null(rng) || nrow(rng) == 0) return()
+    min_ts <- as.Date(as.POSIXct(rng$min_ts[[1]], tz = "UTC"))
+    max_ts <- as.Date(as.POSIXct(rng$max_ts[[1]], tz = "UTC"))
+    updateDateRangeInput(session, "flows_date_range", start = min_ts, end = max_ts)
+  })
+
+  output$flows_range_info <- renderText({
+    rng <- flow_time_range()
+    if (is.null(rng) || nrow(rng) == 0) return("")
+    sprintf("Данные в БД: %s — %s",
+            format(as.POSIXct(rng$min_ts[[1]], tz = "UTC"), "%Y-%m-%d"),
+            format(as.POSIXct(rng$max_ts[[1]], tz = "UTC"), "%Y-%m-%d"))
   })
 
   output$plot_flows_day <- renderPlot({
     auto_tick()
-    df <- fetch_flows_by_day()
+    granularity <- input$flows_granularity %||% "day"
+    date_from <- if (!is.null(input$flows_date_range)) input$flows_date_range[[1]] else NULL
+    date_to <- if (!is.null(input$flows_date_range)) input$flows_date_range[[2]] else NULL
+
+    df <- fetch_flows_by_bucket(granularity = granularity,
+                                 date_from = date_from, date_to = date_to)
     if (is.null(df) || nrow(df) == 0) {
-      plot.new()
-      title("Нет данных")
-      return()
+      plot.new(); title("Нет данных в выбранном диапазоне"); return()
     }
-    df$day <- as.Date(df$day)
-    plot(
-      df$day, df$flows,
-      type = "l", lwd = 2, col = "#2c3e50",
-      xlab = "", ylab = "Потоки",
-      main = ""
+
+    df$bucket <- as.Date(df$bucket)
+    df$flows <- as.numeric(df$flows)
+    df <- df[order(df$bucket), , drop = FALSE]
+
+    par(mar = c(5, 5.5, 1, 1))
+    label_format <- switch(granularity,
+      "month" = "%Y-%m",
+      "week" = "%Y-%m-%d",
+      "%Y-%m-%d"
     )
-    grid(col = "#ecf0f1")
-    points(df$day, df$flows, pch = 19, col = "#2c3e50", cex = 0.6)
+    bp <- barplot(df$flows,
+                  names.arg = format(df$bucket, label_format),
+                  col = "#2c3e50", border = NA,
+                  las = 2, cex.names = 0.75,
+                  ylab = "Потоки", main = "",
+                  yaxt = "n")
+    nice_ticks <- pretty(c(0, max(df$flows, na.rm = TRUE)), n = 6)
+    axis(2, at = nice_ticks, labels = format(nice_ticks, big.mark = " "), las = 1)
+    grid(nx = NA, ny = NULL, col = "#ecf0f1")
   })
 
   output$tbl_recent_runs <- renderDT({
@@ -694,6 +764,8 @@ server <- function(input, output, session) {
     df <- traffic_timeline_data()
     if (is.null(df) || nrow(df) == 0) { plot.new(); title("Нет данных"); return() }
     df$bucket <- as.POSIXct(df$bucket, tz = "UTC")
+    df$flows <- as.numeric(df$flows)
+    df$bytes_sum <- as.numeric(df$bytes_sum)
     df <- df[order(df$bucket), , drop = FALSE]
 
     par(mar = c(4, 4.5, 1, 4.5))
@@ -717,6 +789,7 @@ server <- function(input, output, session) {
     df <- detections_timeline_data()
     if (is.null(df) || nrow(df) == 0) { plot.new(); title("Нет сработок"); return() }
     df$bucket <- as.POSIXct(df$bucket, tz = "UTC")
+    df$detections <- as.numeric(df$detections)
     df <- df[order(df$bucket), , drop = FALSE]
 
     severities <- unique(df$severity)
@@ -742,6 +815,7 @@ server <- function(input, output, session) {
 
   render_top_ips_bar <- function(df, label_col) {
     if (is.null(df) || nrow(df) == 0) { plot.new(); title("Нет данных"); return() }
+    df$flows <- as.numeric(df$flows)
     df <- df[order(df$flows), , drop = FALSE]
     par(mar = c(4, 13, 1, 1))
     barplot(df$flows, names.arg = df[[label_col]], horiz = TRUE, las = 1,
@@ -774,6 +848,7 @@ server <- function(input, output, session) {
     df <- ip_pair_data()
     if (is.null(df) || nrow(df) == 0) { plot.new(); title("Нет пар IP"); return() }
 
+    df$flows <- as.numeric(df$flows)
     src_ips <- unique(df$src_ip)
     dst_ips <- unique(df$dst_ip)
     mat <- matrix(0, nrow = length(src_ips), ncol = length(dst_ips),
