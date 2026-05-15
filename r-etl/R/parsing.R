@@ -242,7 +242,9 @@ parse_zip_csv_member <- function(zip_path, member, source_object, ingest_run_id)
   temp_path <- tempfile(fileext = ".csv")
   on.exit(unlink(temp_path), add = TRUE)
   run_command("sh", c("-lc", sprintf("%s > %s", cmd, shQuote(temp_path))))
-  parse_csv_file(temp_path, source_object, ingest_run_id)
+  member_object <- source_object
+  member_object$source_file_name <- member
+  parse_csv_file(temp_path, member_object, ingest_run_id)
 }
 
 parse_zip_binetflow_member <- function(zip_path, member, source_object, ingest_run_id) {
@@ -250,7 +252,9 @@ parse_zip_binetflow_member <- function(zip_path, member, source_object, ingest_r
   temp_path <- tempfile(fileext = ".binetflow")
   on.exit(unlink(temp_path), add = TRUE)
   run_command("sh", c("-lc", sprintf("%s > %s", cmd, shQuote(temp_path))))
-  parse_binetflow_file(temp_path, source_object, ingest_run_id)
+  member_object <- source_object
+  member_object$source_file_name <- member
+  parse_binetflow_file(temp_path, member_object, ingest_run_id)
 }
 
 parse_kyoto_member <- function(zip_path, member, source_object, ingest_run_id) {
@@ -280,8 +284,9 @@ parse_kyoto_member <- function(zip_path, member, source_object, ingest_run_id) {
   malicious[!is.na(labels_num) & labels_num < 0] <- TRUE
   malicious[!is.na(labels_num) & labels_num > 0] <- FALSE
 
-  frame <- base_unified_frame(nrow(dt), source_object, ingest_run_id, "zip_kyoto", "zip")
-  frame$source_file_name <- rep(member, nrow(frame))
+  member_object <- source_object
+  member_object$source_file_name <- member
+  frame <- base_unified_frame(nrow(dt), member_object, ingest_run_id, "zip_kyoto", "zip")
   frame$flow_start <- flow_start
   frame$duration_sec <- safe_numeric(dt$duration)
   frame$flow_end <- frame$flow_start + frame$duration_sec

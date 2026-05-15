@@ -1,0 +1,34 @@
+title: Common C2 Listener Ports
+id: net-c2-common-listener-ports
+status: experimental
+description: Detects TCP sessions to ports often reused by reverse shells or ad-hoc C2 listeners.
+author: Codex
+logsource:
+    category: network_connection
+    product: idc
+detection:
+    selection_proto:
+        transport_proto: TCP
+    selection_ports:
+        dst_port:
+            - 4444
+            - 5555
+            - 6667
+            - 1337
+            - 31337
+    selection_duration:
+        duration_sec|gte: 30
+    selection_bytes:
+        bytes_total|gte: 1000
+    selection_state:
+        flow_state:
+            - SF
+            - S1
+            - S2
+            - S3
+            - OTH
+    condition: selection_proto and selection_ports and selection_duration and selection_bytes and selection_state
+level: high
+tags:
+    - attack.command-and-control
+    - network

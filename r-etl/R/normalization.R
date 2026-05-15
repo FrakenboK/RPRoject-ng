@@ -81,8 +81,13 @@ empty_network_flows <- function() {
   )
 }
 
-make_event_ids <- function(source_key, n) {
-  paste0(gsub("[^A-Za-z0-9_./-]", "_", source_key), "#", seq_len(n))
+make_event_ids <- function(source_key, source_file_name, source_record_index) {
+  key_part <- gsub("[^A-Za-z0-9_./-]", "_", safe_character(source_key))
+  file_part <- gsub("[^A-Za-z0-9_./-]", "_", safe_character(source_file_name))
+  index_part <- safe_integer(source_record_index)
+  index_part[is.na(index_part) | index_part <= 0L] <- seq_along(index_part)[is.na(index_part) | index_part <= 0L]
+
+  paste0(key_part, "::", file_part, "#", index_part)
 }
 
 base_unified_frame <- function(n, source_object, ingest_run_id, handler_name, source_format = NULL) {
@@ -90,15 +95,24 @@ base_unified_frame <- function(n, source_object, ingest_run_id, handler_name, so
     return(empty_network_flows())
   }
 
+  source_file_name <- if ("source_file_name" %in% names(source_object) &&
+    nzchar(safe_character(source_object$source_file_name[[1]]))) {
+    safe_character(source_object$source_file_name[[1]])
+  } else {
+    basename(source_object$key[[1]])
+  }
+
+  source_record_index <- seq_len(n)
+
   frame <- data.frame(
-    event_id = make_event_ids(source_object$key, n),
+    event_id = make_event_ids(source_object$key[[1]], rep(source_file_name, n), source_record_index),
     ingest_run_id = rep(ingest_run_id, n),
     source_dataset = rep(source_object$dataset_name, n),
     source_key = rep(source_object$key, n),
-    source_file_name = rep(basename(source_object$key), n),
+    source_file_name = rep(source_file_name, n),
     source_format = rep(source_format %||% source_object$extension, n),
     handler_name = rep(handler_name, n),
-    source_record_index = seq_len(n),
+    source_record_index = source_record_index,
     flow_id = rep("", n),
     flow_start = as.POSIXct(rep(NA_real_, n), origin = "1970-01-01", tz = "UTC"),
     flow_end = as.POSIXct(rep(NA_real_, n), origin = "1970-01-01", tz = "UTC"),
@@ -202,6 +216,8 @@ finalize_network_flows <- function(df) {
 
   end_missing <- is.na(df$flow_end) & !is.na(df$flow_start) & !is.na(df$duration_sec)
   df$flow_end[end_missing] <- df$flow_start[end_missing] + df$duration_sec[end_missing]
+
+  df$event_id <- make_event_ids(df$source_key, df$source_file_name, df$source_record_index)
 
   df
 }

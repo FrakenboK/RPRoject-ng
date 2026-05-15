@@ -1,0 +1,24 @@
+title: SMB Failed Access Candidate
+id: net-smb-failed-access
+status: experimental
+description: Detects failed TCP sessions to SMB that can indicate probing or authentication abuse.
+author: Codex
+logsource:
+    category: network_connection
+    product: idc
+detection:
+    selection_proto:
+        transport_proto: TCP
+        dst_port: 445
+    selection_state:
+        flow_state:
+            - S0
+            - REJ
+            - RSTO
+            - RSTR
+    condition: selection_proto and selection_state
+level: medium
+tags:
+    - attack.discovery
+    - attack.t1046
+    - network
