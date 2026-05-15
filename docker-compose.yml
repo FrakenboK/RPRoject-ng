@@ -73,5 +73,17 @@ services:
       - "${UI_PORT:-3838}:3838"
     restart: unless-stopped
 
+  tests:
+    build:
+      context: ./tests
+      dockerfile: docker/Dockerfile.tests
+    environment:
+      REPO_ROOT: /repo
+      TZ: ${TZ:-UTC}
+    volumes:
+      - .:/repo:ro
+    profiles:
+      - tests
+
 volumes:
   clickhouse_data:
