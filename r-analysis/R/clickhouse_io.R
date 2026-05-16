@@ -98,6 +98,28 @@ create_all_analysis_tables <- function(conn) {
   create_analysis_detection_events_table(conn)
 }
 
+quote_sql_string_list <- function(values) {
+  if (length(values) == 0) {
+    return("")
+  }
+
+  paste(vapply(values, quote_sql_string, character(1)), collapse = ", ")
+}
+
+build_source_key_clause <- function(source_keys, column_name = "source_key") {
+  if (is.null(source_keys)) {
+    return("1 = 1")
+  }
+
+  source_keys <- unique(safe_character(source_keys))
+  source_keys <- source_keys[nzchar(source_keys)]
+  if (length(source_keys) == 0) {
+    return("1 = 0")
+  }
+
+  sprintf("%s IN (%s)", column_name, quote_sql_string_list(source_keys))
+}
+
 mark_stale_analysis_runs_failed <- function(conn) {
   DBI::dbExecute(conn, sprintf("
     ALTER TABLE analysis_runs
@@ -113,12 +135,69 @@ insert_analysis_run <- function(conn, run_row) {
   DBI::dbWriteTable(conn, "analysis_runs", run_row, append = TRUE, row.names = FALSE)
 }
 
+build_sql_literal <- function(value) {
+  if (is.null(value) || length(value) == 0 || all(is.na(value))) {
+    return("NULL")
+  }
+
+  scalar <- value[[1]]
+
+  if (inherits(scalar, "POSIXt")) {
+    return(sprintf(
+      "toDateTime(%s)",
+      quote_sql_string(format(as.POSIXct(scalar, tz = "UTC"), "%Y-%m-%d %H:%M:%S"))
+    ))
+  }
+
+  if (is.numeric(scalar)) {
+    if (!is.finite(scalar)) {
+      return("NULL")
+    }
+    return(as.character(scalar))
+  }
+
+  if (is.logical(scalar)) {
+    return(if (isTRUE(scalar)) "1" else "0")
+  }
+
+  quote_sql_string(scalar)
+}
+
+insert_rows_with_values_sql <- function(conn, table_name, rows, chunk_size = 500L) {
+  if (nrow(rows) == 0) {
+    return(invisible(NULL))
+  }
+
+  rows <- as.data.frame(rows, stringsAsFactors = FALSE)
+  column_names <- colnames(rows)
+  chunk_ids <- split(seq_len(nrow(rows)), ceiling(seq_len(nrow(rows)) / max(1L, as.integer(chunk_size))))
+
+  for (idxs in chunk_ids) {
+    value_rows <- vapply(idxs, function(row_idx) {
+      literals <- vapply(column_names, function(col_name) {
+        build_sql_literal(rows[[col_name]][[row_idx]])
+      }, character(1))
+      sprintf("(%s)", paste(literals, collapse = ", "))
+    }, character(1))
+
+    sql <- sprintf(
+      "INSERT INTO %s (%s) VALUES %s",
+      table_name,
+      paste(column_names, collapse = ", "),
+      paste(value_rows, collapse = ", ")
+    )
+    DBI::dbExecute(conn, sql)
+  }
+
+  invisible(NULL)
+}
+
 insert_analysis_detections <- function(conn, rows) {
   if (nrow(rows) == 0) {
     return(invisible(NULL))
   }
 
-  DBI::dbWriteTable(conn, "analysis_detections", rows, append = TRUE, row.names = FALSE)
+  insert_rows_with_values_sql(conn, "analysis_detections", rows)
   info(sprintf("Inserted %d detection summary row(s)", nrow(rows)))
 }
 
@@ -139,7 +218,57 @@ fetch_scalar_count <- function(conn, sql) {
   safe_numeric(result[[1]][[1]])
 }
 
-fetch_src_window_features <- function(conn, window_minutes = 5L) {
+fetch_latest_completed_analysis_time <- function(conn) {
+  result <- DBI::dbGetQuery(conn, "
+    SELECT max(finished_at) AS finished_at
+    FROM analysis_runs
+    WHERE status = 'completed'
+  ")
+
+  if (nrow(result) == 0 || is.null(result$finished_at[[1]]) || is.na(result$finished_at[[1]])) {
+    return(NULL)
+  }
+
+  as.POSIXct(result$finished_at[[1]], tz = "UTC")
+}
+
+fetch_pending_source_keys <- function(conn) {
+  latest_finished <- fetch_latest_completed_analysis_time(conn)
+
+  sql <- if (is.null(latest_finished)) {
+    "
+      SELECT DISTINCT source_key
+      FROM etl_objects
+      WHERE status = 'loaded'
+      ORDER BY source_key
+    "
+  } else {
+    sprintf("
+      SELECT DISTINCT source_key
+      FROM etl_objects
+      WHERE status = 'loaded'
+        AND processed_at > toDateTime(%s)
+      ORDER BY source_key
+    ", quote_sql_string(format(latest_finished, "%Y-%m-%d %H:%M:%S")))
+  }
+
+  result <- DBI::dbGetQuery(conn, sql)
+  if (nrow(result) == 0) {
+    return(character())
+  }
+
+  safe_character(result$source_key)
+}
+
+fetch_flow_count_for_source_keys <- function(conn, source_keys = NULL) {
+  fetch_scalar_count(conn, sprintf("
+    SELECT count() AS cnt
+    FROM network_flows
+    WHERE %s
+  ", build_source_key_clause(source_keys)))
+}
+
+fetch_src_window_features <- function(conn, window_minutes = 5L, source_keys = NULL) {
   sql <- sprintf("
     SELECT
       toStartOfInterval(flow_start, toIntervalMinute(%d)) AS window_start,
@@ -168,13 +297,14 @@ fetch_src_window_features <- function(conn, window_minutes = 5L) {
     WHERE flow_start IS NOT NULL
       AND src_ip != ''
       AND transport_proto = 'TCP'
+      AND %s
     GROUP BY window_start, src_ip, transport_proto
-  ", as.integer(window_minutes))
+  ", as.integer(window_minutes), build_source_key_clause(source_keys))
 
   DBI::dbGetQuery(conn, sql)
 }
 
-fetch_pair_features <- function(conn) {
+fetch_pair_features <- function(conn, source_keys = NULL) {
   sql <- "
     SELECT
       src_ip,
@@ -204,14 +334,15 @@ fetch_pair_features <- function(conn) {
       AND src_ip != ''
       AND dst_ip != ''
       AND transport_proto = 'TCP'
+      AND %s
     GROUP BY src_ip, dst_ip, dst_port, transport_proto
     HAVING count() >= 3
   "
 
-  DBI::dbGetQuery(conn, sql)
+  DBI::dbGetQuery(conn, sprintf(sql, build_source_key_clause(source_keys)))
 }
 
-fetch_signature_matches <- function(conn, sql_where) {
+fetch_signature_matches <- function(conn, sql_where, source_keys = NULL) {
   sql <- sprintf("
     SELECT
       event_id,
@@ -228,12 +359,13 @@ fetch_signature_matches <- function(conn, sql_where) {
       source_key
     FROM network_flows
     WHERE %s
-  ", sql_where)
+      AND %s
+  ", sql_where, build_source_key_clause(source_keys))
 
   DBI::dbGetQuery(conn, sql)
 }
 
-fetch_events_for_window_detection <- function(conn, src_ip, window_start, window_minutes) {
+fetch_events_for_window_detection <- function(conn, src_ip, window_start, window_minutes, source_keys = NULL) {
   start_sql <- format(as.POSIXct(window_start, tz = "UTC"), "%Y-%m-%d %H:%M:%S")
   end_sql <- format(as.POSIXct(window_start, tz = "UTC") + as.difftime(window_minutes, units = "mins"), "%Y-%m-%d %H:%M:%S")
 
@@ -254,16 +386,18 @@ fetch_events_for_window_detection <- function(conn, src_ip, window_start, window
     WHERE src_ip = %s
       AND flow_start >= toDateTime(%s)
       AND flow_start < toDateTime(%s)
+      AND %s
   ",
     quote_sql_string(src_ip),
     quote_sql_string(start_sql),
-    quote_sql_string(end_sql)
+    quote_sql_string(end_sql),
+    build_source_key_clause(source_keys)
   )
 
   DBI::dbGetQuery(conn, sql)
 }
 
-fetch_events_for_pair_detection <- function(conn, src_ip, dst_ip, dst_port, transport_proto) {
+fetch_events_for_pair_detection <- function(conn, src_ip, dst_ip, dst_port, transport_proto, source_keys = NULL) {
   sql <- sprintf("
     SELECT
       event_id,
@@ -282,11 +416,13 @@ fetch_events_for_pair_detection <- function(conn, src_ip, dst_ip, dst_port, tran
       AND dst_ip = %s
       AND dst_port = %s
       AND transport_proto = %s
+      AND %s
   ",
     quote_sql_string(src_ip),
     quote_sql_string(dst_ip),
     ifelse(is.na(dst_port), "NULL", as.character(as.integer(dst_port))),
-    quote_sql_string(transport_proto)
+    quote_sql_string(transport_proto),
+    build_source_key_clause(source_keys)
   )
 
   DBI::dbGetQuery(conn, sql)

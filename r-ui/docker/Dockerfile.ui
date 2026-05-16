@@ -3,26 +3,34 @@ FROM rocker/r-ver:4.3.2
 ENV DEBIAN_FRONTEND=noninteractive
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
+    awscli \
     ca-certificates \
     curl \
+    fonts-dejavu-core \
     gnupg \
     libcurl4-openssl-dev \
     libgit2-dev \
+    locales \
     libssl-dev \
     libxml2-dev \
     make \
     g++ \
     pkg-config \
+    tshark \
     && curl -fsSL https://download.docker.com/linux/debian/gpg \
        | gpg --dearmor -o /usr/share/keyrings/docker.gpg \
     && echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/docker.gpg] https://download.docker.com/linux/debian bookworm stable" \
        > /etc/apt/sources.list.d/docker.list \
     && apt-get update \
     && apt-get install -y --no-install-recommends docker-ce-cli docker-compose-plugin \
+    && sed -i '/ru_RU.UTF-8/s/^# //g' /etc/locale.gen \
+    && locale-gen \
     && rm -rf /var/lib/apt/lists/*
 
 ENV PAK_SYSREQS=false
 ENV MAKEFLAGS="-j4"
+ENV LANG=ru_RU.UTF-8
+ENV LC_ALL=ru_RU.UTF-8
 
 RUN R -q -e "install.packages('pak', repos = sprintf('https://r-lib.github.io/p/pak/stable/%s/%s/%s', .Platform[['pkgType']], R.Version()[['os']], R.Version()[['arch']]))"
 

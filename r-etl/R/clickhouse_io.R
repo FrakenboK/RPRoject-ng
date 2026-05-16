@@ -1,6 +1,10 @@
 library(DBI)
 library(RClickhouse)
 
+quote_sql_string <- function(value) {
+  sprintf("'%s'", gsub("'", "''", safe_character(value), fixed = TRUE))
+}
+
 get_clickhouse_connection <- function() {
   DBI::dbConnect(
     RClickhouse::clickhouse(),
@@ -65,6 +69,7 @@ create_etl_objects_table <- function(conn) {
       source_format    LowCardinality(String),
       handler_name     LowCardinality(String),
       object_size      Nullable(UInt64),
+      object_etag      String,
       status           LowCardinality(String),
       records_loaded   Nullable(UInt64),
       processed_at     DateTime,
@@ -72,11 +77,44 @@ create_etl_objects_table <- function(conn) {
     ) ENGINE = MergeTree()
     ORDER BY (processed_at, source_key)
   ")
+
+  DBI::dbExecute(conn, "
+    ALTER TABLE etl_objects
+    ADD COLUMN IF NOT EXISTS object_etag String
+  ")
 }
 
 create_all_tables <- function(conn) {
   create_network_flows_table(conn)
   create_etl_objects_table(conn)
+}
+
+is_source_object_loaded <- function(conn, source_object) {
+  object_etag <- safe_character(source_object$etag %||% "")
+  if (nzchar(object_etag)) {
+    sql <- sprintf(
+      "SELECT count() AS c
+       FROM etl_objects
+       WHERE source_key = %s
+         AND status = 'loaded'
+         AND object_etag = %s",
+      quote_sql_string(source_object$key[[1]]),
+      quote_sql_string(object_etag)
+    )
+  } else {
+    sql <- sprintf(
+      "SELECT count() AS c
+       FROM etl_objects
+       WHERE source_key = %s
+         AND status = 'loaded'
+         AND ifNull(object_size, 0) = %s",
+      quote_sql_string(source_object$key[[1]]),
+      as.character(as.numeric(source_object$size[[1]] %||% 0))
+    )
+  }
+
+  result <- DBI::dbGetQuery(conn, sql)
+  nrow(result) == 1 && suppressWarnings(as.numeric(result$c[[1]])) > 0
 }
 
 prepare_network_flows_for_insert <- function(df) {
@@ -117,6 +155,7 @@ build_object_status_row <- function(ingest_run_id, source_object, handler_name, 
     source_format = source_object$extension,
     handler_name = handler_name,
     object_size = source_object$size,
+    object_etag = safe_character(source_object$etag %||% ""),
     status = status,
     records_loaded = records_loaded,
     processed_at = Sys.time(),
