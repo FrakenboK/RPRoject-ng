@@ -55,3 +55,26 @@ source_ui_runner <- function() {
   base <- file.path(REPO_ROOT, "r-ui/R")
   source(file.path(base, "runner.R"), local = FALSE)
 }
+
+# Selectively load helper definitions from app.R without running shinyApp().
+source_ui_app_helpers <- function() {
+  app_path <- file.path(REPO_ROOT, "r-ui/R/app.R")
+  target_names <- c(
+    "%||%", "plot_family", "set_plot_par", "render_empty_plot",
+    "build_time_choices", "split_time_value", "safe_range_value",
+    "combine_date_time", "format_int", "format_bytes",
+    "severity_badge", "status_badge"
+  )
+  exprs <- parse(file = app_path)
+  for (expr in exprs) {
+    if (length(expr) >= 2 && is.call(expr) &&
+        identical(expr[[1]], as.name("<-"))) {
+      tgt <- expr[[2]]
+      nm <- if (is.name(tgt)) as.character(tgt) else NA_character_
+      if (!is.na(nm) && nm %in% target_names) {
+        eval(expr, envir = .GlobalEnv)
+      }
+    }
+  }
+  invisible(TRUE)
+}
