@@ -405,26 +405,7 @@ detection:
 
 ### 2.3. `net_smb_failed_access.yml`
 
-**Правило (level: `medium`)**:
-
-```yaml
-title: SMB Failed Access Candidate
-id: net-smb-failed-access
-detection:
-    selection_proto:
-        transport_proto: TCP
-        dst_port: 445
-    selection_state:
-        flow_state: [INT, REQ, RST, CLO]
-    condition: selection_proto and selection_state
-```
-
-**Сгенерированный SQL WHERE**:
-
-```sql
-(transport_proto = 'TCP' AND dst_port = 445)
-  AND (flow_state = 'INT' OR flow_state = 'REQ' OR flow_state = 'RST' OR flow_state = 'CLO')
-```
+**Правило (level: `medium`)**: аналогично SSH Brute Force, но `dst_port: 445`, `flow_state: [INT, REQ, RST, CLO]`, `condition: selection_proto and selection_state`.
 
 **Тестовые данные**:
 
@@ -446,26 +427,7 @@ detection:
 
 ### 2.4. `net_rdp_failed_access.yml`
 
-**Правило (level: `medium`)**:
-
-```yaml
-title: RDP Failed Access Candidate
-id: net-rdp-failed-access
-detection:
-    selection_proto:
-        transport_proto: TCP
-        dst_port: 3389
-    selection_state:
-        flow_state: [INT, REQ, RST, CLO]
-    condition: selection_proto and selection_state
-```
-
-**Сгенерированный SQL WHERE**:
-
-```sql
-(transport_proto = 'TCP' AND dst_port = 3389)
-  AND (flow_state = 'INT' OR flow_state = 'REQ' OR flow_state = 'RST' OR flow_state = 'CLO')
-```
+**Правило (level: `medium`)**: аналогично SSH Brute Force, но `dst_port: 3389`, `flow_state: [INT, REQ, RST, CLO]`, `condition: selection_proto and selection_state`.
 
 **Тестовые данные**:
 
@@ -1410,3 +1372,516 @@ selection_range:
 4. **Isolation Forest** обучен на 200 деревьев с параметром `sample_size = min(n, 256)`.
 
 5. Все агрегаты считаются на лету в ClickHouse, ML-модели обучаются в памяти R-процесса. При очень больших данных (>100 млн flow-записей) рекомендуется увеличить лимиты `max_window_ml_rows` / `max_pair_ml_rows` в коде `behavioral_detectors.R`.
+
+---
+
+## 11. Интерпретация результатов
+
+При анализе сработок полезно учитывать несколько факторов:
+
+- **Соотношение signature/behavioral**: преобладание сигнатурных сработок говорит о том, что трафик содержит известные паттерны (brute force, сканирование, C2-порты). Преобладание поведенческих — о сложных аномалиях, не описываемых простыми правилами.
+
+- **Confidence score в behavioral-сработках**: ensemble_score ≥ 0.90 означает консенсус всех трёх алгоритмов (DBSCAN, LOF, Isolation Forest). Score 0.80–0.90 — согласие двух из трёх.
+
+- **Корреляция сработок**: если один и тот же `src_ip` порождает одновременно SSH Brute Force (signature) + Vertical Port Scan (behavioral) + TTL Spoofing — это сильный индикатор атакующего.
+- **Поле `description` в `analysis_detections`** содержит человекочитаемое описание и может использоваться для быстрого триажа в UI.
+
+---
+
+## Инкрементальный анализ и идемпотентность ETL
+
+### Контекст изменений
+
+В последних обновлениях проекта два ключевых модуля получили механизмы, позволяющие избегать повторной обработки уже загруженных данных:
+
+- **ETL** научился пропускать объекты, которые уже были успешно загружены в предыдущем запуске — идентификация по `ETag` объекта в S3 или по `object_size` как fallback.
+- **Analysis** научился анализировать только те `source_key`, которые были загружены ETL после последнего завершённого прогона анализа — инкрементальный режим через `pending_source_keys`.
+
+Оба изменения работают независимо, но вместе создают полный цикл: ETL не дублирует строки в `network_flows`, analysis не дублирует сработки в `analysis_detections`.
+
+---
+
+### Идемпотентность ETL: `object_etag`
+
+#### Что изменилось в схеме
+
+В таблицу `etl_objects` добавлено поле `object_etag`:
+
+```sql
+ALTER TABLE etl_objects
+ADD COLUMN IF NOT EXISTS object_etag String
+```
+
+Полная DDL `etl_objects` теперь:
+
+```sql
+CREATE TABLE IF NOT EXISTS etl_objects (
+  ingest_run_id    String,
+  source_key       String,
+  source_dataset   LowCardinality(String),
+  source_format    LowCardinality(String),
+  handler_name     LowCardinality(String),
+  object_size      Nullable(UInt64),
+  object_etag      String,               -- ← новое поле
+  status           LowCardinality(String),
+  records_loaded   Nullable(UInt64),
+  processed_at     DateTime,
+  message          String
+) ENGINE = MergeTree()
+ORDER BY (processed_at, source_key)
+```
+
+`object_etag` заполняется из метаданных S3-объекта при листинге бакета. Для локальных файлов (`LOCAL_DATA_DIR`) ETag недоступен — в этом случае поле остаётся пустой строкой.
+
+#### Логика проверки дублей
+
+Функция `is_source_object_loaded()` проверяет, был ли объект уже успешно загружен, до того как ETL скачивает его и запускает handler:
+
+```
+Если object_etag непустой:
+    SELECT count() FROM etl_objects
+    WHERE source_key = <key>
+      AND status = 'loaded'
+      AND object_etag = <etag>
+
+Если object_etag пустой (локальный файл):
+    SELECT count() FROM etl_objects
+    WHERE source_key = <key>
+      AND status = 'loaded'
+      AND ifNull(object_size, 0) = <size>
+```
+
+Если count > 0 — объект скипается, в `etl_objects` пишется запись со `status = 'skipped'` и `handler_name = 'already_loaded'`.
+
+#### Поведение при повторном `docker compose up etl-init`
+
+**Первый запуск:**
+
+```
+[INFO] Discovered 4 object(s) in bucket
+[INFO] Processing dataset/unsw-nb15/part1.csv with handler csv
+[INFO] Inserted 82002 row(s) into network_flows
+[INFO] Processing dataset/stratosphere/capture.pcap with handler pcap_zeek
+[INFO] Inserted 14400 row(s) into network_flows
+[INFO] Processing dataset/kyoto/2011.zip with handler zip
+[INFO] Inserted 210000 row(s) into network_flows
+[INFO] ETL pipeline completed successfully
+```
+
+**Повторный запуск (без изменений в бакете):**
+
+```
+[INFO] Discovered 4 object(s) in bucket
+[INFO] Skipping already loaded object: dataset/unsw-nb15/part1.csv
+[INFO] Skipping already loaded object: dataset/stratosphere/capture.pcap
+[INFO] Skipping already loaded object: dataset/kyoto/2011.zip
+[INFO] ETL pipeline completed successfully
+```
+
+Ни одной новой строки в `network_flows`. `etl_objects` получит три новые записи со `status = 'skipped'`.
+
+**Добавление нового объекта в бакет:**
+
+```
+[INFO] Discovered 5 object(s) in bucket
+[INFO] Skipping already loaded object: dataset/unsw-nb15/part1.csv
+[INFO] Skipping already loaded object: dataset/stratosphere/capture.pcap
+[INFO] Skipping already loaded object: dataset/kyoto/2011.zip
+[INFO] Processing dataset/unsw-nb15/part2.csv with handler csv
+[INFO] Inserted 75430 row(s) into network_flows
+[INFO] ETL pipeline completed successfully
+```
+
+Загружен только новый объект.
+
+#### Как проверить статус объектов
+
+```sql
+SELECT
+    source_key,
+    object_etag,
+    status,
+    records_loaded,
+    processed_at
+FROM etl_objects
+ORDER BY processed_at DESC
+LIMIT 20;
+```
+
+Или только по статусам:
+
+```sql
+SELECT status, count() AS cnt
+FROM etl_objects
+GROUP BY status
+ORDER BY cnt DESC;
+```
+
+Типичный результат после нескольких запусков:
+
+| status | cnt |
+|---|---|
+| loaded | 4 |
+| skipped | 8 |
+| failed | 0 |
+
+---
+
+### Инкрементальный анализ: `pending_source_keys`
+
+#### Проблема, которую решает механизм
+
+До этого изменения `analysis` при каждом запуске сканировал **всю** таблицу `network_flows`. Если ETL добавил 50 000 новых строк к существующим 2 млн — `analysis` прогонял все 2 млн через каждое Sigma-правило и все поведенческие детекторы. Это создавало:
+
+- дублирование сработок (одни и те же потоки детектировались повторно);
+- избыточную нагрузку на ClickHouse;
+- некорректное поле `flow_rows_scanned` в `analysis_runs`.
+
+#### Как работает `fetch_pending_source_keys()`
+
+При старте `run_analysis_pipeline()` вызывается `fetch_pending_source_keys()`:
+
+```
+1. Получить время последнего завершённого analysis_run:
+   SELECT max(finished_at) FROM analysis_runs WHERE status = 'completed'
+
+2. Если завершённых runs нет → вернуть все source_key из etl_objects WHERE status = 'loaded'
+
+3. Если есть → вернуть только те source_key, у которых processed_at > max(finished_at)
+   SELECT DISTINCT source_key FROM etl_objects
+   WHERE status = 'loaded'
+     AND processed_at > <last_finished_at>
+```
+
+Результат — список `pending_source_keys`: строки `source_key`, которые ещё не анализировались.
+
+#### Влияние на Sigma-анализ
+
+`run_signature_analysis()` теперь принимает `source_keys` и передаёт их в `build_source_key_clause()`. Каждый SQL-запрос правила получает дополнительный предикат:
+
+```sql
+-- Было:
+SELECT * FROM network_flows
+WHERE (transport_proto = 'TCP' AND dst_port = 22)
+  AND (flow_state IN ('INT', 'REQ', 'RST'))
+
+-- Стало:
+SELECT * FROM network_flows
+WHERE (transport_proto = 'TCP' AND dst_port = 22)
+  AND (flow_state IN ('INT', 'REQ', 'RST'))
+  AND source_key IN ('dataset/unsw-nb15/part2.csv')
+```
+
+Таким образом, правила физически не видят уже проанализированные потоки.
+
+#### Влияние на поведенческий анализ
+
+Аналогично `fetch_src_window_features()` и `fetch_src_dst_features()` получили параметр `source_keys`. Оконные агрегаты строятся только по новым объектам:
+
+```sql
+SELECT
+  toStartOfInterval(flow_start, toIntervalMinute(5)) AS window_start,
+  src_ip,
+  transport_proto,
+  count() AS flow_count,
+  ...
+FROM network_flows
+WHERE flow_start IS NOT NULL
+  AND src_ip != ''
+  AND transport_proto = 'TCP'
+  AND source_key IN ('dataset/unsw-nb15/part2.csv')  -- ← фильтр
+GROUP BY window_start, src_ip, transport_proto
+```
+
+#### Поведение когда нечего анализировать
+
+Если `pending_source_keys` пустой (все объекты уже проанализированы), `analysis` завершается досрочно без запуска Sigma и поведенческих детекторов:
+
+```
+[INFO] Analysis skipped: no new ETL objects found
+```
+
+В `analysis_runs` записывается:
+
+| status | detections_total | message |
+|---|---|---|
+| completed | 0 | No new ETL objects found for analysis |
+
+#### `flow_rows_scanned` теперь отражает реальный охват
+
+Поле `flow_rows_scanned` в `analysis_runs` раньше было `SELECT count() FROM network_flows` — т.е. всегда полный размер таблицы. Теперь это `fetch_flow_count_for_source_keys(conn, pending_source_keys)`:
+
+```sql
+SELECT count() AS cnt
+FROM network_flows
+WHERE source_key IN (<pending_source_keys>)
+```
+
+Значение показывает именно то количество flow-записей, которое было обработано в данном конкретном прогоне.
+
+---
+
+### Новые фильтры в UI
+
+#### Фильтрация сработок по источнику данных
+
+Вкладка «Сработки» получила три новых фильтра:
+
+| Фильтр | Тип | Описание |
+|---|---|---|
+| Source Format | Мультиселект | `pcap`, `csv`, `binetflow` — формат исходного файла |
+| Source Dataset | Мультиселект | `UNSW-NB15`, `Stratosphere IPS`, `Kyoto 2006+` |
+| Source Key Pattern | Текстовое поле | Подстрока из `source_key` (case-insensitive) |
+
+Фильтры работают через JOIN `analysis_detection_events` → `network_flows`, потому что сама таблица `analysis_detections` не хранит provenance-поля напрямую. Subquery `build_detection_sources_subquery()` агрегирует уникальные значения `source_dataset`, `source_format`, `source_key`, `source_file_name` по каждому `detection_id`:
+
+```sql
+SELECT
+  e.detection_id AS detection_id,
+  arrayStringConcat(arraySort(groupUniqArray(
+    ifNull(f.source_dataset, e.source_dataset)
+  )), ', ') AS source_dataset,
+  arrayStringConcat(arraySort(groupUniqArray(
+    ifNull(f.source_format, '')
+  )), ', ') AS source_format,
+  arrayStringConcat(arraySort(groupUniqArray(
+    ifNull(f.source_key, e.source_key)
+  )), ', ') AS source_key,
+  arrayStringConcat(arraySort(groupUniqArray(
+    ifNull(f.source_file_name, '')
+  )), ', ') AS source_file_name
+FROM analysis_detection_events e
+LEFT JOIN network_flows f ON f.event_id = e.event_id
+GROUP BY e.detection_id
+```
+
+Результат — строка вида `"UNSW-NB15, Kyoto 2006+"` для сработки, которая захватила потоки из двух датасетов одновременно.
+
+#### Фильтрация по дате: исправленное поведение
+
+До изменений `date_from` и `date_to` форматировались хардкодом с `00:00:00` и `23:59:59`. Теперь `format_time_bound()` корректно обрабатывает как `Date`, так и `POSIXct`:
+
+- Если передан `Date` — добавляет `00:00:00` для `date_from` и `23:59:59` для `date_to`
+- Если передан `POSIXct` — использует точное время без усечения
+
+Это позволяет UI фильтровать с точностью до секунды при работе с дашбордом в реальном времени.
+
+---
+
+### Полная картина жизненного цикла объекта
+
+```
+S3 / local_data
+      │
+      ▼
+list_s3_objects() / list_local_objects()
+      │ возвращает source_object{ key, size, etag, dataset, extension }
+      ▼
+is_source_object_loaded(conn, source_object)
+      │ TRUE  → запись status='skipped' в etl_objects, пропуск
+      │ FALSE ↓
+      ▼
+choose_handler(key) → pcap_zeek | binetflow | csv | zip
+      │
+      ▼
+parse_*(path, source_object, ingest_run_id)
+      │ возвращает data.frame network_flows
+      ▼
+insert_network_flows(conn, flows)
+      │ строки в network_flows с source_key = <key>
+      ▼
+insert_etl_object_status(..., status='loaded', object_etag=<etag>)
+      │
+      ╔═══════════════════════╗
+      ║  etl_objects          ║
+      ║  status='loaded'      ║
+      ║  object_etag=<etag>   ║
+      ╚═══════════════════════╝
+```
+
+После завершения ETL:
+
+```
+fetch_pending_source_keys(conn)
+      │ смотрит max(finished_at) из analysis_runs WHERE status='completed'
+      │ возвращает source_key из etl_objects WHERE processed_at > last_finished
+      ▼
+run_signature_analysis(conn, ..., source_keys=pending)
+run_behavioral_analysis(conn, ..., source_keys=pending)
+      │
+      ▼
+analysis_detections   ← сработки только по новым source_key
+analysis_detection_events ← привязка event_id к detection_id
+      │
+      ▼
+finish_analysis_run(conn, ..., status='completed')
+      │ обновляет finished_at → станет новым порогом для следующего запуска
+```
+
+---
+
+### Как убедиться, что инкрементальность работает корректно
+
+**1. Проверить pending_source_keys вручную:**
+
+```sql
+-- Время последнего завершённого analysis
+SELECT max(finished_at) AS last_analysis
+FROM analysis_runs
+WHERE status = 'completed';
+
+-- Объекты, загруженные после него
+SELECT source_key, processed_at
+FROM etl_objects
+WHERE status = 'loaded'
+  AND processed_at > (
+    SELECT max(finished_at)
+    FROM analysis_runs
+    WHERE status = 'completed'
+  )
+ORDER BY processed_at;
+```
+
+Если запрос возвращает пустой результат — следующий запуск `analysis` завершится со статусом `completed` и `detections_total = 0`.
+
+**2. Проверить, что сработки не дублируются:**
+
+```sql
+SELECT
+    rule_id,
+    src_ip,
+    count() AS detection_count
+FROM analysis_detections
+GROUP BY rule_id, src_ip
+HAVING detection_count > 1
+ORDER BY detection_count DESC
+LIMIT 20;
+```
+
+При корректной инкрементальности одна и та же пара `(rule_id, src_ip)` не должна появляться более одного раза для одного и того же `source_key`. Если дубли есть — скорее всего, `analysis_runs` не содержит завершённой записи с корректным `finished_at`.
+
+**3. Проверить `flow_rows_scanned` в `analysis_runs`:**
+
+```sql
+SELECT
+    analysis_run_id,
+    started_at,
+    status,
+    flow_rows_scanned,
+    detections_total,
+    message
+FROM analysis_runs
+ORDER BY started_at DESC
+LIMIT 5;
+```
+
+`flow_rows_scanned` должен совпадать с суммой `records_loaded` из `etl_objects` для соответствующих `pending_source_keys`, а не с полным `count()` таблицы `network_flows`.
+
+---
+
+### Обновлённая схема `etl_objects`
+
+Полный список полей с описанием:
+
+| Поле | Тип | Описание |
+|---|---|---|
+| `ingest_run_id` | String | UUID прогона ETL, в котором был обработан объект |
+| `source_key` | String | S3-ключ или путь к локальному файлу |
+| `source_dataset` | LowCardinality(String) | Имя датасета: `UNSW-NB15`, `Stratosphere IPS`, `Kyoto 2006+` |
+| `source_format` | LowCardinality(String) | Формат: `pcap`, `csv`, `binetflow`, `zip` |
+| `handler_name` | LowCardinality(String) | Имя handler-функции: `pcap_zeek`, `csv_unsw_nb15`, `binetflow`, `zip`, `already_loaded`, `unsupported` |
+| `object_size` | Nullable(UInt64) | Размер объекта в байтах из S3-метаданных |
+| `object_etag` | String | ETag из S3 (MD5 или multipart hash); пустая строка для локальных файлов |
+| `status` | LowCardinality(String) | `loaded` / `skipped` / `failed` |
+| `records_loaded` | Nullable(UInt64) | Количество строк, записанных в `network_flows` |
+| `processed_at` | DateTime | Время записи статуса |
+| `message` | String | Сообщение об ошибке или причине skip |
+
+#### Значения `handler_name`
+
+| Значение | Когда выставляется |
+|---|---|
+| `pcap_zeek` | PCAP/PCAPNG, обработан через Zeek `conn.log` |
+| `csv_unsw_nb15` | CSV с заголовком UNSW-NB15 или без заголовка с нужным числом колонок |
+| `binetflow` | BiNetFlow (argus-формат) |
+| `zip` | ZIP-архив с вложенными файлами (Kyoto 2006+) |
+| `already_loaded` | Объект уже загружен в предыдущем прогоне (идемпотентность) |
+| `unsupported` | Расширение файла не распознано |
+
+---
+
+### Обновлённая схема `analysis_runs`
+
+Поле `flow_rows_scanned` изменило семантику:
+
+| Поле | Было | Стало |
+|---|---|---|
+| `flow_rows_scanned` | `SELECT count() FROM network_flows` — всегда полный размер таблицы | `SELECT count() FROM network_flows WHERE source_key IN (<pending>)` — только новые объекты |
+| `message` | Всегда пустая строка | Заполняется при skip (`"No new ETL objects found for analysis"`) или ошибке |
+
+Поле `message` теперь используется для двух случаев:
+- `"No new ETL objects found for analysis"` — нет новых объектов, анализ пропущен
+- Текст исключения — при падении `run_analysis_pipeline()` в `on.exit` обработчике
+
+---
+
+### FAQ
+
+**Q: ETL завершился успешно, но `analysis` говорит "no new source objects". Почему?**
+
+A: `analysis` смотрит на `processed_at` в `etl_objects`. Если время завершения последнего `analysis_run` (`finished_at`) новее, чем `processed_at` всех загруженных объектов — pending-список пуст. Убедитесь, что ETL-прогон действительно добавил новые объекты:
+
+```sql
+SELECT source_key, processed_at, status
+FROM etl_objects
+ORDER BY processed_at DESC
+LIMIT 5;
+```
+
+**Q: Хочу переанализировать все данные с нуля. Как?**
+
+A: Удалите все записи из `analysis_runs` и `analysis_detections`:
+
+```sql
+TRUNCATE TABLE analysis_detections;
+TRUNCATE TABLE analysis_detection_events;
+TRUNCATE TABLE analysis_runs;
+```
+
+После этого следующий запуск `analysis` воспримет все `etl_objects` со `status = 'loaded'` как pending и проанализирует полный объём `network_flows`.
+
+**Q: Можно ли принудительно запустить анализ для конкретного `source_key`?**
+
+A: Напрямую через переменные окружения — нет. Workaround: удалить запись из `analysis_runs` для нужного временного диапазона или временно выставить `finished_at` заведомо раньше `processed_at` нужного объекта:
+
+```sql
+-- Сдвинуть finished_at последнего run назад
+ALTER TABLE analysis_runs UPDATE
+  finished_at = toDateTime('2000-01-01 00:00:00')
+WHERE analysis_run_id = '<run_id>';
+```
+
+После этого `fetch_pending_source_keys()` вернёт нужные объекты.
+
+**Q: ETag объекта в S3 изменился (файл был заменён). ETL загрузит новую версию?**
+
+A: Да. `is_source_object_loaded()` при наличии ETag проверяет точное совпадение `object_etag`. Если ETag изменился — объект считается новым и загружается заново. Это приведёт к дублированию строк в `network_flows` если старые строки не были удалены — учитывайте при замене файлов в бакете.
+
+**Q: Как мониторить прогресс ETL в реальном времени?**
+
+Следите за логами контейнера:
+
+```bash
+docker compose logs -f etl-init
+```
+
+Параллельно можно смотреть на накопление строк в ClickHouse:
+
+```bash
+watch -n 2 'docker compose exec clickhouse clickhouse-client \
+  --user $CLICKHOUSE_USER --password $CLICKHOUSE_PASSWORD \
+  --database $CLICKHOUSE_DATABASE \
+  --query "SELECT count() FROM network_flows"'
+```
+
+
