@@ -66,8 +66,8 @@ run_outlier_ensemble <- function(matrix_scaled, min_pts = 10L) {
   )
 }
 
-build_window_detection_events <- function(conn, analysis_run_id, detection_id, rule_id, detector_name, src_ip, window_start, window_minutes) {
-  events <- fetch_events_for_window_detection(conn, src_ip, window_start, window_minutes)
+build_window_detection_events <- function(conn, analysis_run_id, detection_id, rule_id, detector_name, src_ip, window_start, window_minutes, source_keys = NULL) {
+  events <- fetch_events_for_window_detection(conn, src_ip, window_start, window_minutes, source_keys = source_keys)
   if (nrow(events) == 0) {
     return(data.frame())
   }
@@ -92,8 +92,8 @@ build_window_detection_events <- function(conn, analysis_run_id, detection_id, r
   )
 }
 
-build_pair_detection_events <- function(conn, analysis_run_id, detection_id, rule_id, src_ip, dst_ip, dst_port, transport_proto) {
-  events <- fetch_events_for_pair_detection(conn, src_ip, dst_ip, dst_port, transport_proto)
+build_pair_detection_events <- function(conn, analysis_run_id, detection_id, rule_id, src_ip, dst_ip, dst_port, transport_proto, source_keys = NULL) {
+  events <- fetch_events_for_pair_detection(conn, src_ip, dst_ip, dst_port, transport_proto, source_keys = source_keys)
   if (nrow(events) == 0) {
     return(data.frame())
   }
@@ -118,9 +118,10 @@ build_pair_detection_events <- function(conn, analysis_run_id, detection_id, rul
   )
 }
 
-run_behavioral_analysis <- function(conn, analysis_run_id, window_minutes = 5L) {
-  src_window <- as.data.table(fetch_src_window_features(conn, window_minutes = window_minutes))
-  pair_features <- as.data.table(fetch_pair_features(conn))
+run_behavioral_analysis <- function(conn, analysis_run_id, window_minutes = 5L, source_keys = NULL) {
+  src_window <- as.data.table(fetch_src_window_features(conn, window_minutes = window_minutes, source_keys = source_keys))
+  pair_features <- as.data.table(fetch_pair_features(conn, source_keys = source_keys))
+  source_key_clause <- build_source_key_clause(source_keys)
   max_window_ml_rows <- 20000L
   max_pair_ml_rows <- 15000L
 
@@ -279,7 +280,8 @@ run_behavioral_analysis <- function(conn, analysis_run_id, window_minutes = 5L) 
           detector_name = detector_name,
           src_ip = row$src_ip[[1]],
           window_start = row$window_start[[1]],
-          window_minutes = window_minutes
+          window_minutes = window_minutes,
+          source_keys = source_keys
         )
       }
     }
@@ -459,7 +461,8 @@ run_behavioral_analysis <- function(conn, analysis_run_id, window_minutes = 5L) 
           src_ip = row$src_ip[[1]],
           dst_ip = row$dst_ip[[1]],
           dst_port = row$dst_port[[1]],
-          transport_proto = row$transport_proto[[1]]
+          transport_proto = row$transport_proto[[1]],
+          source_keys = source_keys
         )
       }
     }
@@ -476,12 +479,16 @@ run_behavioral_analysis <- function(conn, analysis_run_id, window_minutes = 5L) 
     WHERE flow_start IS NOT NULL
       AND src_ip != ''
       AND transport_proto = 'UDP'
+      AND %s
     GROUP BY window_start, src_ip
     HAVING count() > 500 AND uniqExact(dst_ip) > 3
     LIMIT 10000
   "
 
-  udp_flood <- tryCatch(as.data.table(DBI::dbGetQuery(conn, udp_query)), error = function(e) data.table())
+  udp_flood <- tryCatch(
+    as.data.table(DBI::dbGetQuery(conn, sprintf(udp_query, source_key_clause))),
+    error = function(e) data.table()
+  )
   if (nrow(udp_flood) > 0) {
     info(sprintf("Behavioral stage: %d UDP flood candidate row(s) detected", nrow(udp_flood)))
 
@@ -534,7 +541,8 @@ run_behavioral_analysis <- function(conn, analysis_run_id, window_minutes = 5L) 
         detector_name = "udp_flood",
         src_ip = safe_character(row$src_ip[[1]]),
         window_start = as.POSIXct(row$window_start[[1]], tz = "UTC"),
-        window_minutes = 5L
+        window_minutes = 5L,
+        source_keys = source_keys
       )
     }
   }
@@ -549,12 +557,13 @@ run_behavioral_analysis <- function(conn, analysis_run_id, window_minutes = 5L) 
     FROM network_flows
     WHERE src_ttl IS NOT NULL
       AND src_ip != ''
+      AND %s
     GROUP BY src_ip
     HAVING uniq_src_ttl > 2 AND count() >= 5
     LIMIT 10000
   "
 
-  ttl_anomalies <- tryCatch(DBI::dbGetQuery(conn, ttl_query), error = function(e) data.frame())
+  ttl_anomalies <- tryCatch(DBI::dbGetQuery(conn, sprintf(ttl_query, source_key_clause)), error = function(e) data.frame())
   if (nrow(ttl_anomalies) > 0) {
     info(sprintf("Behavioral stage: %d TTL anomaly row(s) detected", nrow(ttl_anomalies)))
 
@@ -606,7 +615,8 @@ run_behavioral_analysis <- function(conn, analysis_run_id, window_minutes = 5L) 
         detector_name = "ttl_anomaly",
         src_ip = safe_character(row$src_ip[[1]]),
         window_start = tryCatch(as.POSIXct(row$first_seen[[1]], tz = "UTC"), error = function(e) as.POSIXct(NA, tz = "UTC")),
-        window_minutes = window_minutes
+        window_minutes = window_minutes,
+        source_keys = source_keys
       )
       }, error = function(e) {
         warning_log(sprintf("TTL detection row %d failed: %s", idx, e$message))
@@ -625,12 +635,13 @@ run_behavioral_analysis <- function(conn, analysis_run_id, window_minutes = 5L) 
     WHERE dst_port = 53
       AND transport_proto = 'UDP'
       AND src_ip != ''
+      AND %s
     GROUP BY src_ip
     HAVING avg(toFloat64(ifNull(bytes_total, 0))) > 300 AND count() > 50
     LIMIT 10000
   "
 
-  dns_tunnels <- tryCatch(DBI::dbGetQuery(conn, dns_query), error = function(e) data.frame())
+  dns_tunnels <- tryCatch(DBI::dbGetQuery(conn, sprintf(dns_query, source_key_clause)), error = function(e) data.frame())
   if (nrow(dns_tunnels) > 0) {
     info(sprintf("Behavioral stage: %d DNS tunneling candidate row(s) detected", nrow(dns_tunnels)))
 
@@ -682,7 +693,8 @@ run_behavioral_analysis <- function(conn, analysis_run_id, window_minutes = 5L) 
         detector_name = "dns_tunneling",
         src_ip = safe_character(row$src_ip[[1]]),
         window_start = tryCatch(as.POSIXct(row$first_seen[[1]], tz = "UTC"), error = function(e) as.POSIXct(NA, tz = "UTC")),
-        window_minutes = window_minutes
+        window_minutes = window_minutes,
+        source_keys = source_keys
       )
       }, error = function(e) {
         warning_log(sprintf("DNS detection row %d failed: %s", idx, e$message))

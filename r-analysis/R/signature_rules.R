@@ -169,7 +169,7 @@ condition_to_sql <- function(condition, selection_sql) {
   sql
 }
 
-run_signature_analysis <- function(conn, analysis_run_id, rules_dir) {
+run_signature_analysis <- function(conn, analysis_run_id, rules_dir, source_keys = NULL) {
   rules <- load_sigma_rules(rules_dir)
   if (length(rules) == 0) {
     warning_log("No Sigma rules found")
@@ -181,7 +181,7 @@ run_signature_analysis <- function(conn, analysis_run_id, rules_dir) {
 
   for (rule in rules) {
     sql_where <- build_sigma_sql(rule)
-    matches <- fetch_signature_matches(conn, sql_where)
+    matches <- fetch_signature_matches(conn, sql_where, source_keys = source_keys)
 
     if (nrow(matches) == 0) {
       next

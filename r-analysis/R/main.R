@@ -3,18 +3,18 @@ source("R/clickhouse_io.R")
 source("R/signature_rules.R")
 source("R/behavioral_detectors.R")
 
-start_analysis_run <- function(conn, analysis_run_id) {
+start_analysis_run <- function(conn, analysis_run_id, source_keys = NULL, message = "") {
   run_row <- data.frame(
     analysis_run_id = analysis_run_id,
     started_at = Sys.time(),
     finished_at = as.POSIXct(NA, origin = "1970-01-01", tz = "UTC"),
     status = "running",
     source_table = "network_flows",
-    flow_rows_scanned = fetch_scalar_count(conn, "SELECT count() AS cnt FROM network_flows"),
+    flow_rows_scanned = fetch_flow_count_for_source_keys(conn, source_keys),
     detections_total = NA_real_,
     signature_total = NA_real_,
     behavioral_total = NA_real_,
-    message = "",
+    message = message,
     stringsAsFactors = FALSE
   )
 
@@ -55,7 +55,13 @@ run_analysis_pipeline <- function() {
 
   create_all_analysis_tables(conn)
   mark_stale_analysis_runs_failed(conn)
-  start_analysis_run(conn, analysis_run_id)
+  pending_source_keys <- fetch_pending_source_keys(conn)
+  start_analysis_run(
+    conn,
+    analysis_run_id,
+    source_keys = pending_source_keys,
+    message = if (length(pending_source_keys) == 0) "no new source objects to analyze" else ""
+  )
   completed <- FALSE
   on.exit({
     if (!completed) {
@@ -80,8 +86,28 @@ run_analysis_pipeline <- function() {
     window_minutes <- 5L
   }
 
-  signature <- run_signature_analysis(conn, analysis_run_id, rules_dir)
-  behavioral <- run_behavioral_analysis(conn, analysis_run_id, window_minutes = window_minutes)
+  if (length(pending_source_keys) == 0) {
+    finish_analysis_run(
+      conn = conn,
+      analysis_run_id = analysis_run_id,
+      status = "completed",
+      detections_total = 0L,
+      signature_total = 0L,
+      behavioral_total = 0L,
+      message = "No new ETL objects found for analysis"
+    )
+    completed <- TRUE
+    info("Analysis skipped: no new ETL objects found")
+    return(invisible(NULL))
+  }
+
+  signature <- run_signature_analysis(conn, analysis_run_id, rules_dir, source_keys = pending_source_keys)
+  behavioral <- run_behavioral_analysis(
+    conn,
+    analysis_run_id,
+    window_minutes = window_minutes,
+    source_keys = pending_source_keys
+  )
 
   signature_detections <- if (nrow(signature$detections) == 0) 0L else nrow(signature$detections)
   behavioral_detections <- if (nrow(behavioral$detections) == 0) 0L else nrow(behavioral$detections)

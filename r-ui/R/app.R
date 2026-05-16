@@ -7,7 +7,55 @@ library(jsonlite)
 source("clickhouse_io.R", local = TRUE)
 source("runner.R", local = TRUE)
 
+options(bitmapType = "cairo")
+try(Sys.setlocale("LC_CTYPE", "ru_RU.UTF-8"), silent = TRUE)
+try(Sys.setlocale("LC_TIME", "ru_RU.UTF-8"), silent = TRUE)
+
 `%||%` <- function(a, b) if (is.null(a) || length(a) == 0 || (length(a) == 1 && is.na(a))) b else a
+
+plot_family <- function() "DejaVu Sans"
+
+set_plot_par <- function(...) {
+  par(family = plot_family(), ...)
+}
+
+render_empty_plot <- function(label) {
+  set_plot_par(mar = c(1, 1, 1, 1))
+  plot.new()
+  text(0.5, 0.5, label, cex = 1.05)
+}
+
+build_time_choices <- function(step_minutes = 15L) {
+  values <- seq(0, 24 * 60 - step_minutes, by = step_minutes)
+  labels <- sprintf("%02d:%02d", values %/% 60, values %% 60)
+  c(labels, "23:59")
+}
+
+split_time_value <- function(value, fallback = c("00:00", "23:59")) {
+  ts_value <- as.POSIXct(value, tz = "UTC")
+  if (length(ts_value) == 0 || is.na(ts_value[[1]])) {
+    return(fallback[[1]])
+  }
+
+  format(ts_value[[1]], "%H:%M")
+}
+
+safe_range_value <- function(range_value, index) {
+  if (is.null(range_value) || length(range_value) < index || is.na(range_value[[index]])) {
+    return(NULL)
+  }
+
+  range_value[[index]]
+}
+
+combine_date_time <- function(date_value, time_value, end_default = FALSE) {
+  if (is.null(date_value) || length(date_value) == 0 || is.na(date_value)) {
+    return(NULL)
+  }
+
+  time_value <- time_value %||% if (isTRUE(end_default)) "23:59" else "00:00"
+  as.POSIXct(sprintf("%s %s:00", format(as.Date(date_value), "%Y-%m-%d"), time_value), tz = "UTC")
+}
 
 format_int <- function(x) {
   if (is.null(x) || is.na(x)) return("—")
@@ -49,7 +97,7 @@ status_badge <- function(state) {
 
 ui <- page_navbar(
   id = "main_nav",
-  title = "RPRoject-ng IDC",
+  title = "RPR IPS",
   theme = bs_theme(bootswatch = "flatly", version = 5),
   fillable = FALSE,
 
@@ -162,12 +210,30 @@ ui <- page_navbar(
         ),
         textInput("f_src_ip", "src_ip"),
         textInput("f_dst_ip", "dst_ip"),
+        checkboxGroupInput(
+          "f_source_format",
+          "Формат источника",
+          choices = character(),
+          selected = character()
+        ),
+        checkboxGroupInput(
+          "f_source_dataset",
+          "Датасет-источник",
+          choices = character(),
+          selected = character()
+        ),
+        textInput("f_source_key", "source_key / file"),
         dateRangeInput(
           "f_date_range",
           "Период (created_at)",
-          start = Sys.Date() - 30,
-          end = Sys.Date()
+          start = NULL,
+          end = NULL,
+          startview = "month",
+          weekstart = 1,
+          separator = " — "
         ),
+        selectInput("f_time_from", "Время с", choices = build_time_choices(), selected = "00:00"),
+        selectInput("f_time_to", "Время по", choices = build_time_choices(), selected = "23:59"),
         numericInput("f_limit", "Лимит строк", value = 1000, min = 50, max = 50000, step = 50),
         actionButton("f_refresh", "Обновить", icon = icon("arrows-rotate"), class = "btn-primary w-100")
       ),
@@ -239,7 +305,16 @@ ui <- page_navbar(
 
     card(
       card_header("Всплески трафика (потоки + байты)"),
-      sliderInput("traffic_bucket_min", "Размер бакета (мин)", min = 1, max = 60, value = 5, step = 1),
+      layout_columns(
+        col_widths = c(3, 3, 3, 3),
+        sliderInput("traffic_bucket_min", "Размер бакета (мин)", min = 1, max = 60, value = 5, step = 1),
+        dateRangeInput("traffic_date_range", "Диапазон дат",
+                       start = NULL, end = NULL,
+                       startview = "month", weekstart = 1, separator = " — "),
+        selectInput("traffic_time_from", "Время с", choices = build_time_choices(), selected = "00:00"),
+        selectInput("traffic_time_to", "Время по", choices = build_time_choices(), selected = "23:59")
+      ),
+      actionButton("traffic_reset", "Авто-диапазон", icon = icon("magnifying-glass-arrow-right"), class = "btn-secondary"),
       plotOutput("plot_traffic_timeline", height = "320px")
     ),
 
@@ -329,8 +404,7 @@ server <- function(input, output, session) {
     auto_tick()
     df <- fetch_severity_breakdown()
     if (is.null(df) || nrow(df) == 0) {
-      plot.new()
-      title("Нет данных")
+      render_empty_plot("Нет данных")
       return()
     }
     df$detections <- as.numeric(df$detections)
@@ -339,7 +413,7 @@ server <- function(input, output, session) {
               ifelse(df$severity == "medium", "#f39c12",
               ifelse(df$severity == "low", "#3498db", "#95a5a6")))
 
-    par(mar = c(4, 5, 2, 1))
+    set_plot_par(mar = c(4, 5, 2, 1))
     counts_sqrt <- sqrt(df$detections)
     ymax <- max(counts_sqrt) * 1.18
     bp <- barplot(
@@ -364,6 +438,11 @@ server <- function(input, output, session) {
     fetch_flow_time_range()
   })
 
+  detection_time_range <- reactive({
+    auto_tick()
+    fetch_detection_time_range()
+  })
+
   observe({
     rng <- flow_time_range()
     if (is.null(rng) || nrow(rng) == 0) return()
@@ -373,6 +452,12 @@ server <- function(input, output, session) {
         (is.null(input$flows_date_range) || is.na(input$flows_date_range[[1]]))) {
       updateDateRangeInput(session, "flows_date_range", start = min_ts, end = max_ts)
     }
+    if (!is.na(min_ts) && !is.na(max_ts) &&
+        (is.null(input$traffic_date_range) || is.na(input$traffic_date_range[[1]]))) {
+      updateDateRangeInput(session, "traffic_date_range", start = min_ts, end = max_ts)
+      updateSelectInput(session, "traffic_time_from", selected = split_time_value(rng$min_ts[[1]], "00:00"))
+      updateSelectInput(session, "traffic_time_to", selected = split_time_value(rng$max_ts[[1]], "23:59"))
+    }
   })
 
   observeEvent(input$flows_reset, {
@@ -381,6 +466,32 @@ server <- function(input, output, session) {
     min_ts <- as.Date(as.POSIXct(rng$min_ts[[1]], tz = "UTC"))
     max_ts <- as.Date(as.POSIXct(rng$max_ts[[1]], tz = "UTC"))
     updateDateRangeInput(session, "flows_date_range", start = min_ts, end = max_ts)
+  })
+
+  observeEvent(input$traffic_reset, {
+    rng <- flow_time_range()
+    if (is.null(rng) || nrow(rng) == 0) return()
+    updateDateRangeInput(
+      session,
+      "traffic_date_range",
+      start = as.Date(as.POSIXct(rng$min_ts[[1]], tz = "UTC")),
+      end = as.Date(as.POSIXct(rng$max_ts[[1]], tz = "UTC"))
+    )
+    updateSelectInput(session, "traffic_time_from", selected = split_time_value(rng$min_ts[[1]], "00:00"))
+    updateSelectInput(session, "traffic_time_to", selected = split_time_value(rng$max_ts[[1]], "23:59"))
+  })
+
+  observe({
+    rng <- detection_time_range()
+    if (is.null(rng) || nrow(rng) == 0) return()
+    min_ts <- as.Date(as.POSIXct(rng$min_ts[[1]], tz = "UTC"))
+    max_ts <- as.Date(as.POSIXct(rng$max_ts[[1]], tz = "UTC"))
+    if (!is.na(min_ts) && !is.na(max_ts) &&
+        (is.null(input$f_date_range) || is.na(input$f_date_range[[1]]))) {
+      updateDateRangeInput(session, "f_date_range", start = min_ts, end = max_ts)
+      updateSelectInput(session, "f_time_from", selected = split_time_value(rng$min_ts[[1]], "00:00"))
+      updateSelectInput(session, "f_time_to", selected = split_time_value(rng$max_ts[[1]], "23:59"))
+    }
   })
 
   output$flows_range_info <- renderText({
@@ -400,14 +511,14 @@ server <- function(input, output, session) {
     df <- fetch_flows_by_bucket(granularity = granularity,
                                  date_from = date_from, date_to = date_to)
     if (is.null(df) || nrow(df) == 0) {
-      plot.new(); title("Нет данных в выбранном диапазоне"); return()
+      render_empty_plot("Нет данных в выбранном диапазоне"); return()
     }
 
     df$bucket <- as.Date(df$bucket)
     df$flows <- as.numeric(df$flows)
     df <- df[order(df$bucket), , drop = FALSE]
 
-    par(mar = c(5, 5.5, 1, 1))
+    set_plot_par(mar = c(5, 5.5, 1, 1))
     label_format <- switch(granularity,
       "month" = "%Y-%m",
       "week" = "%Y-%m-%d",
@@ -455,6 +566,29 @@ server <- function(input, output, session) {
     )
   })
 
+  observe({
+    auto_tick()
+    options <- fetch_detection_filter_options()
+
+    source_formats <- sort(unique(as.character(options$source_formats$source_format %||% character())))
+    source_formats <- source_formats[nzchar(source_formats)]
+    updateCheckboxGroupInput(
+      session,
+      "f_source_format",
+      choices = source_formats,
+      selected = intersect(input$f_source_format %||% source_formats, source_formats)
+    )
+
+    source_datasets <- sort(unique(as.character(options$source_datasets$source_dataset %||% character())))
+    source_datasets <- source_datasets[nzchar(source_datasets)]
+    updateCheckboxGroupInput(
+      session,
+      "f_source_dataset",
+      choices = source_datasets,
+      selected = intersect(input$f_source_dataset %||% source_datasets, source_datasets)
+    )
+  })
+
   detections_data <- eventReactive(
     list(input$f_refresh, auto_tick()),
     {
@@ -464,8 +598,11 @@ server <- function(input, output, session) {
           severities = input$f_severity,
           src_ip = input$f_src_ip,
           dst_ip = input$f_dst_ip,
-          date_from = input$f_date_range[[1]],
-          date_to = input$f_date_range[[2]],
+          source_formats = input$f_source_format,
+          source_datasets = input$f_source_dataset,
+          source_key_pattern = input$f_source_key,
+          date_from = combine_date_time(safe_range_value(input$f_date_range, 1), input$f_time_from, end_default = FALSE),
+          date_to = combine_date_time(safe_range_value(input$f_date_range, 2), input$f_time_to, end_default = TRUE),
           limit = input$f_limit %||% 1000L
         )
       })
@@ -545,6 +682,12 @@ server <- function(input, output, session) {
       tags$dd(class = "col-sm-7", format_int(row$flow_count)),
       tags$dt(class = "col-sm-5", "confidence"),
       tags$dd(class = "col-sm-7", sprintf("%.2f", as.numeric(row$confidence_score %||% 0))),
+      tags$dt(class = "col-sm-5", "source_format"),
+      tags$dd(class = "col-sm-7", code(row$source_format %||% "")),
+      tags$dt(class = "col-sm-5", "source_dataset"),
+      tags$dd(class = "col-sm-7", row$source_dataset %||% ""),
+      tags$dt(class = "col-sm-5", "source_key"),
+      tags$dd(class = "col-sm-7", code(row$source_key %||% "")),
       tags$dt(class = "col-sm-5", "description"),
       tags$dd(class = "col-sm-7", row$description),
       tags$dt(class = "col-sm-5", "tags"),
@@ -578,7 +721,7 @@ server <- function(input, output, session) {
   output$plot_dd_gantt <- renderPlot({
     detail <- tryCatch(detection_detail(), error = function(e) NULL)
     if (is.null(detail) || is.null(detail$sessions) || nrow(detail$sessions) == 0) {
-      plot.new(); title("Нет сессий"); return()
+      render_empty_plot("Нет сессий"); return()
     }
 
     df <- detail$sessions
@@ -595,7 +738,7 @@ server <- function(input, output, session) {
       ifelse(state == "OTH", "#7f8c8d", "#3498db")))
     }
 
-    par(mar = c(4, 14, 1, 1))
+    set_plot_par(mar = c(4, 14, 1, 1))
     y_positions <- seq_len(nrow(df))
     labels <- sprintf("%s:%s→%s:%s",
                       substr(df$src_ip, 1, 15),
@@ -709,66 +852,96 @@ server <- function(input, output, session) {
     as.integer(bucket_min) * 60L
   })
 
+  traffic_window <- reactive({
+    list(
+      date_from = combine_date_time(safe_range_value(input$traffic_date_range, 1), input$traffic_time_from, end_default = FALSE),
+      date_to = combine_date_time(safe_range_value(input$traffic_date_range, 2), input$traffic_time_to, end_default = TRUE)
+    )
+  })
+
   traffic_timeline_data <- reactive({
     auto_tick()
-    fetch_traffic_timeline(traffic_bucket_seconds())
+    rng <- traffic_window()
+    fetch_traffic_timeline(traffic_bucket_seconds(), date_from = rng$date_from, date_to = rng$date_to)
   })
 
   detections_timeline_data <- reactive({
     auto_tick()
-    fetch_traffic_timeline_by_severity(traffic_bucket_seconds())
+    rng <- traffic_window()
+    fetch_traffic_timeline_by_severity(traffic_bucket_seconds(), date_from = rng$date_from, date_to = rng$date_to)
   })
 
   top_src_data <- reactive({
     auto_tick()
-    fetch_top_src_ips(limit = 15L)
+    rng <- traffic_window()
+    fetch_top_src_ips(limit = 15L, date_from = rng$date_from, date_to = rng$date_to)
   })
 
   top_dst_data <- reactive({
     auto_tick()
-    fetch_top_dst_ips(limit = 15L)
+    rng <- traffic_window()
+    fetch_top_dst_ips(limit = 15L, date_from = rng$date_from, date_to = rng$date_to)
   })
 
   ip_pair_data <- reactive({
     auto_tick()
-    fetch_ip_pair_matrix(src_limit = 15L, dst_limit = 15L)
+    rng <- traffic_window()
+    fetch_ip_pair_matrix(src_limit = 15L, dst_limit = 15L, date_from = rng$date_from, date_to = rng$date_to)
   })
 
   output$kpi_uniq_src <- renderText({
-    df <- top_src_data()
-    if (is.null(df) || nrow(df) == 0) return("—")
-    res <- safe_query("SELECT uniqExact(src_ip) AS c FROM network_flows WHERE src_ip != ''",
+    rng <- traffic_window()
+    conditions <- c("src_ip != ''")
+    if (!is.null(rng$date_from)) conditions <- c(conditions, sprintf("flow_start >= toDateTime(%s)", quote_sql(format(rng$date_from, "%Y-%m-%d %H:%M:%S"))))
+    if (!is.null(rng$date_to)) conditions <- c(conditions, sprintf("flow_start <= toDateTime(%s)", quote_sql(format(rng$date_to, "%Y-%m-%d %H:%M:%S"))))
+    res <- safe_query(sprintf("SELECT uniqExact(src_ip) AS c FROM network_flows WHERE %s",
+                              paste(conditions, collapse = " AND ")),
                       data.frame(c = 0))
     format_int(as.numeric(res$c[[1]]))
   })
 
   output$kpi_uniq_dst <- renderText({
-    res <- safe_query("SELECT uniqExact(dst_ip) AS c FROM network_flows WHERE dst_ip != ''",
+    rng <- traffic_window()
+    conditions <- c("dst_ip != ''")
+    if (!is.null(rng$date_from)) conditions <- c(conditions, sprintf("flow_start >= toDateTime(%s)", quote_sql(format(rng$date_from, "%Y-%m-%d %H:%M:%S"))))
+    if (!is.null(rng$date_to)) conditions <- c(conditions, sprintf("flow_start <= toDateTime(%s)", quote_sql(format(rng$date_to, "%Y-%m-%d %H:%M:%S"))))
+    res <- safe_query(sprintf("SELECT uniqExact(dst_ip) AS c FROM network_flows WHERE %s",
+                              paste(conditions, collapse = " AND ")),
                       data.frame(c = 0))
     format_int(as.numeric(res$c[[1]]))
   })
 
   output$kpi_total_bytes <- renderText({
-    res <- safe_query("SELECT sum(toFloat64(ifNull(bytes_total, 0))) AS c FROM network_flows",
+    rng <- traffic_window()
+    conditions <- c("1 = 1")
+    if (!is.null(rng$date_from)) conditions <- c(conditions, sprintf("flow_start >= toDateTime(%s)", quote_sql(format(rng$date_from, "%Y-%m-%d %H:%M:%S"))))
+    if (!is.null(rng$date_to)) conditions <- c(conditions, sprintf("flow_start <= toDateTime(%s)", quote_sql(format(rng$date_to, "%Y-%m-%d %H:%M:%S"))))
+    res <- safe_query(sprintf("SELECT sum(toFloat64(ifNull(bytes_total, 0))) AS c FROM network_flows WHERE %s",
+                              paste(conditions, collapse = " AND ")),
                       data.frame(c = 0))
     format_bytes(as.numeric(res$c[[1]]))
   })
 
   output$kpi_total_packets <- renderText({
-    res <- safe_query("SELECT sum(toFloat64(ifNull(packets_total, 0))) AS c FROM network_flows",
+    rng <- traffic_window()
+    conditions <- c("1 = 1")
+    if (!is.null(rng$date_from)) conditions <- c(conditions, sprintf("flow_start >= toDateTime(%s)", quote_sql(format(rng$date_from, "%Y-%m-%d %H:%M:%S"))))
+    if (!is.null(rng$date_to)) conditions <- c(conditions, sprintf("flow_start <= toDateTime(%s)", quote_sql(format(rng$date_to, "%Y-%m-%d %H:%M:%S"))))
+    res <- safe_query(sprintf("SELECT sum(toFloat64(ifNull(packets_total, 0))) AS c FROM network_flows WHERE %s",
+                              paste(conditions, collapse = " AND ")),
                       data.frame(c = 0))
     format_int(as.numeric(res$c[[1]]))
   })
 
   output$plot_traffic_timeline <- renderPlot({
     df <- traffic_timeline_data()
-    if (is.null(df) || nrow(df) == 0) { plot.new(); title("Нет данных"); return() }
+    if (is.null(df) || nrow(df) == 0) { render_empty_plot("Нет данных"); return() }
     df$bucket <- as.POSIXct(df$bucket, tz = "UTC")
     df$flows <- as.numeric(df$flows)
     df$bytes_sum <- as.numeric(df$bytes_sum)
     df <- df[order(df$bucket), , drop = FALSE]
 
-    par(mar = c(4, 4.5, 1, 4.5))
+    set_plot_par(mar = c(4, 4.5, 1, 4.5))
     plot(df$bucket, df$flows, type = "l", lwd = 2, col = "#2c3e50",
          xlab = "Время", ylab = "Потоки", main = "")
     points(df$bucket, df$flows, pch = 19, col = "#2c3e50", cex = 0.5)
@@ -787,7 +960,7 @@ server <- function(input, output, session) {
 
   output$plot_detections_timeline <- renderPlot({
     df <- detections_timeline_data()
-    if (is.null(df) || nrow(df) == 0) { plot.new(); title("Нет сработок"); return() }
+    if (is.null(df) || nrow(df) == 0) { render_empty_plot("Нет сработок"); return() }
     df$bucket <- as.POSIXct(df$bucket, tz = "UTC")
     df$detections <- as.numeric(df$detections)
     df <- df[order(df$bucket), , drop = FALSE]
@@ -796,7 +969,7 @@ server <- function(input, output, session) {
     palette_map <- c(critical = "#c0392b", high = "#e74c3c",
                      medium = "#f39c12", low = "#3498db")
 
-    par(mar = c(4, 4.5, 1, 1))
+    set_plot_par(mar = c(4, 4.5, 1, 1))
     plot(range(df$bucket), c(0, max(df$detections, na.rm = TRUE) * 1.05),
          type = "n", xlab = "Время", ylab = "Сработок")
     grid(col = "#ecf0f1")
@@ -814,10 +987,10 @@ server <- function(input, output, session) {
   })
 
   render_top_ips_bar <- function(df, label_col) {
-    if (is.null(df) || nrow(df) == 0) { plot.new(); title("Нет данных"); return() }
+    if (is.null(df) || nrow(df) == 0) { render_empty_plot("Нет данных"); return() }
     df$flows <- as.numeric(df$flows)
     df <- df[order(df$flows), , drop = FALSE]
-    par(mar = c(4, 13, 1, 1))
+    set_plot_par(mar = c(4, 13, 1, 1))
     barplot(df$flows, names.arg = df[[label_col]], horiz = TRUE, las = 1,
             col = "#2c3e50", border = NA, cex.names = 0.78,
             xlab = "Число flow", main = "")
@@ -846,7 +1019,7 @@ server <- function(input, output, session) {
 
   output$plot_ip_heatmap <- renderPlot({
     df <- ip_pair_data()
-    if (is.null(df) || nrow(df) == 0) { plot.new(); title("Нет пар IP"); return() }
+    if (is.null(df) || nrow(df) == 0) { render_empty_plot("Нет пар IP"); return() }
 
     df$flows <- as.numeric(df$flows)
     src_ips <- unique(df$src_ip)
@@ -859,7 +1032,7 @@ server <- function(input, output, session) {
 
     log_mat <- log1p(mat)
 
-    par(mar = c(10, 12, 1, 1))
+    set_plot_par(mar = c(10, 12, 1, 1))
     palette_heat <- colorRampPalette(c("#ecf0f1", "#3498db", "#9b59b6", "#e74c3c"))(64)
     image(seq_len(ncol(log_mat)), seq_len(nrow(log_mat)), t(log_mat[nrow(log_mat):1, , drop = FALSE]),
           col = palette_heat, xaxt = "n", yaxt = "n", xlab = "", ylab = "")

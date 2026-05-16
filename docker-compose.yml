@@ -64,6 +64,9 @@ services:
       CLICKHOUSE_PORT: 9000
       COMPOSE_PROJECT_DIR: /compose
       COMPOSE_PROJECT_NAME: ${COMPOSE_PROJECT_NAME:-rproject-ng}
+      LOCAL_DATA_DIR: /compose/local_data
+      LANG: ru_RU.UTF-8
+      LC_ALL: ru_RU.UTF-8
       TZ: ${TZ:-UTC}
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock

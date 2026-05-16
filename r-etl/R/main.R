@@ -6,6 +6,19 @@ source("R/tcp_sessions.R")
 source("R/clickhouse_io.R")
 
 process_source_object <- function(conn, source_object, ingest_run_id, staging_dir) {
+  if (is_source_object_loaded(conn, source_object)) {
+    info(sprintf("Skipping already loaded object: %s", source_object$key))
+    insert_etl_object_status(conn, build_object_status_row(
+      ingest_run_id = ingest_run_id,
+      source_object = source_object,
+      handler_name = "already_loaded",
+      status = "skipped",
+      records_loaded = 0,
+      message = "Object already loaded in previous ETL run"
+    ))
+    return(invisible(0L))
+  }
+
   local_data_dir <- Sys.getenv("LOCAL_DATA_DIR", "")
   if (nzchar(local_data_dir)) {
     local_path <- get_local_file_path(source_object)
