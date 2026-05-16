@@ -148,22 +148,18 @@ insert_network_flows <- function(conn, flows) {
 }
 
 build_object_status_row <- function(ingest_run_id, source_object, handler_name, status, records_loaded, message) {
-  safe_nullable_uint64 <- function(v) {
-    v <- suppressWarnings(as.numeric(v %||% NA))
-    if (length(v) == 0 || all(is.na(v)) || !all(is.finite(v))) NA_integer_ else as.integer(v[[1]])
-  }
   data.frame(
     ingest_run_id = ingest_run_id,
     source_key = source_object$key,
     source_dataset = source_object$dataset_name,
     source_format = source_object$extension,
     handler_name = handler_name,
-    object_size = safe_nullable_uint64(source_object$size),
+    object_size = source_object$size,
     object_etag = safe_character(source_object$etag %||% ""),
     status = status,
-    records_loaded = safe_nullable_uint64(records_loaded),
+    records_loaded = records_loaded,
     processed_at = Sys.time(),
-    message = safe_character(message %||% ""),
+    message = message,
     stringsAsFactors = FALSE
   )
 }
