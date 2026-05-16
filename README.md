@@ -21,13 +21,29 @@
 
 ```bash
 cp .env.example .env
-docker compose up --build etl-init
-docker compose up --build analysis
-docker compose up --build ui
+./run.sh
 ```
 
 UI доступен на `http://localhost:3838` (порт настраивается переменной `UI_PORT`).
 `ClickHouse` наружу не публикуется и доступен только внутри docker-сети.
+
+Скрипт `run.sh` автоматически:
+
+- собирает образы `etl-init`, `analysis`, `ui`
+- запускает `clickhouse`
+- дожидается статуса `healthy`
+- последовательно выполняет `etl-init` и `analysis`
+- поднимает `ui`
+
+Альтернативно тот же порядок можно выполнить вручную:
+
+```bash
+docker compose build etl-init analysis ui
+docker compose up -d clickhouse
+docker compose run --rm etl-init
+docker compose run --rm analysis
+docker compose up -d ui
+```
 
 ## Что уже сделано
 
@@ -118,7 +134,7 @@ UI доступен на `http://localhost:3838` (порт настраивае�
 ## UI
 
 - `Shiny`-приложение поверх `ClickHouse`
-- четыре вкладки: Обзор, Сработки, Детализация, Действия
+- пять вкладок: Обзор, Сработки, Детализация, Трафик, Действия
 - запуск ETL/analysis из UI через `docker compose run` (требует монтирования `docker.sock`)
 - подробности в [r-ui/README.md](r-ui/README.md)
 
@@ -170,6 +186,7 @@ UI доступен на `http://localhost:3838` (порт настраивае�
 ```text
 RPRoject-ng/
 ├─ .env.example
+├─ run.sh
 ├─ docker-compose.yml
 ├─ r-etl/
 │  ├─ README.md
@@ -1883,5 +1900,4 @@ watch -n 2 'docker compose exec clickhouse clickhouse-client \
   --database $CLICKHOUSE_DATABASE \
   --query "SELECT count() FROM network_flows"'
 ```
-
 
